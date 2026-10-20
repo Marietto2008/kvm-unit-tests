@@ -470,6 +470,109 @@ static void test_vmcs_high(void)
 	free_page(vmcs);
 }
 
+/*
+ * Claude 20/10/2026 (bhyve nested, parere #22 di Astra): quanti campi
+ * scrivibili e riconosciuti del VMCS corrente valgono quanto il cookie dato.
+ */
+static int count_vmcs_fields_equal(u8 cookie)
+{
+	struct vmcs_field *f;
+	u64 actual;
+	int i, n = 0, ret;
+
+	for (i = 0; i < ARRAY_SIZE(vmcs_fields); i++) {
+		f = &vmcs_fields[i];
+		if (f->encoding == VMX_INST_ERROR || vmcs_field_readonly(f))
+			continue;
+		ret = vmcs_read_safe(f->encoding, &actual);
+		assert(!(ret & X86_EFLAGS_CF));
+		if (ret & X86_EFLAGS_ZF)
+			continue;
+		if ((actual & f->mask) == vmcs_field_value(f, cookie))
+			n++;
+	}
+	return n;
+}
+
+/*
+ * Claude 20/10/2026 (bhyve nested, parere #22 di Astra): il contenuto di un
+ * VMCS sopravvive a VMCLEAR e alla sostituzione della cache dell'hypervisor,
+ * e un VMCS nuovo non eredita i campi di un altro (SDM 24.11.1/24.11.3:
+ * migrazione = VMCLEAR su un LP, VMPTRLD su un altro). test_vmcs_lifecycle
+ * passava anche con un hypervisor che scartava il VMCS al VMCLEAR, perche'
+ * il VMPTRLD successivo ritrovava il proprio posto con i campi vecchi: qui
+ * altri VMCS passano in mezzo, e cinque VMCS attivi forzano uno sfratto.
+ */
+static void test_vmcs_persist(void)
+{
+	struct vmcs *v[6];
+	int i, n1;
+
+	for (i = 0; i < ARRAY_SIZE(v); i++) {
+		v[i] = alloc_page();
+		v[i]->hdr.revision_id = basic_msr.revision;
+	}
+
+	/* A (cookie 1) e B (cookie 2) passano dallo stesso posto, poi si
+	 * ricarica A: deve avere i SUOI campi */
+	assert(!vmcs_clear(v[0]));
+	assert(!make_vmcs_current(v[0]));
+	set_all_vmcs_fields(1);
+	assert(!vmcs_clear(v[0]));
+	assert(!vmcs_clear(v[1]));
+	assert(!make_vmcs_current(v[1]));
+	set_all_vmcs_fields(2);
+	assert(!vmcs_clear(v[1]));
+	assert(!make_vmcs_current(v[0]));
+	report(check_all_vmcs_fields(1),
+	    "persist: VMCS0 intatto dopo VMCLEAR e VMCS1 in mezzo");
+	assert(!make_vmcs_current(v[1]));
+	report(check_all_vmcs_fields(2), "persist: VMCS1 intatto");
+
+	/* un VMCS appena inizializzato non eredita i campi di A o di B */
+	assert(!vmcs_clear(v[0]));
+	assert(!vmcs_clear(v[1]));
+	assert(!vmcs_clear(v[5]));
+	assert(!make_vmcs_current(v[5]));
+	n1 = count_vmcs_fields_equal(1) + count_vmcs_fields_equal(2);
+	report(n1 == 0, "persist: VMCS nuovo senza campi altrui (%d)", n1);
+
+	/* sfratto: A attivo con cookie 3, poi altri 4 VMCS attivi (senza
+	 * VMCLEAR di A): A deve tornare intatto, e restare clear */
+	assert(!make_vmcs_current(v[0]));
+	set_all_vmcs_fields(3);
+	for (i = 1; i <= 4; i++) {
+		assert(!vmcs_clear(v[i]));
+		assert(!make_vmcs_current(v[i]));
+		set_all_vmcs_fields(10 + i);
+	}
+	assert(!make_vmcs_current(v[0]));
+	report(check_all_vmcs_fields(3), "persist: VMCS0 intatto dopo sfratto");
+	for (i = 1; i <= 4; i++) {
+		assert(!make_vmcs_current(v[i]));
+		report(check_all_vmcs_fields(10 + i),
+		    "persist: VMCS%d intatto dopo sfratto", i);
+	}
+	/* launch state clear conservato attraverso lo sfratto: VMRESUME deve
+	 * fallire con errore 5 (VMRESUME con VMCS non launched), controllato
+	 * prima dei campi di controllo (SDM 26.1) */
+	{
+		u64 rflags;
+
+		assert(!make_vmcs_current(v[0]));
+		asm volatile("vmresume; pushf; pop %0"
+		    : "=r"(rflags) : : "memory", "cc");
+		report((rflags & X86_EFLAGS_ZF) &&
+		    vmcs_read(VMX_INST_ERROR) == 5,
+		    "persist: VMCS0 resta clear dopo sfratto (VMRESUME -> 5)");
+	}
+
+	for (i = 0; i < ARRAY_SIZE(v); i++) {
+		assert(!vmcs_clear(v[i]));
+		free_page(v[i]);
+	}
+}
+
 static void test_vmcs_lifecycle(void)
 {
 	struct vmcs *vmcs[2] = {};
@@ -2122,6 +2225,8 @@ int main(int argc, const char *argv[])
 		test_vmcs_high();
 	if (test_wanted("test_vmcs_lifecycle", argv, argc))
 		test_vmcs_lifecycle();
+	if (test_wanted("test_vmcs_persist", argv, argc))
+		test_vmcs_persist();
 	if (test_wanted("test_vmx_caps", argv, argc))
 		test_vmx_caps();
 	if (test_wanted("test_vmread_flags_touch", argv, argc))
