@@ -553,6 +553,82 @@ static int test_ctrl_efer_exit_handler(union exit_reason exit_reason)
 	return VMX_TEST_VMEXIT;
 }
 
+/*
+ * Claude 20/10/2026 (bhyve nested, parere #22 di Astra): le quattro
+ * combinazioni di ENT_LOAD_EFER e EXI_SAVE_EFER. L2 scrive EFER con una
+ * WRMSR non intercettata e fa VMCALL. All'uscita GUEST_EFER del VMCS deve
+ * valere: con EXI_SAVE_EFER l'EFER che L2 aveva in uso; senza, il valore
+ * che L1 vi aveva scritto (SDM 28.3: il campo si aggiorna solo se il save
+ * control e' attivo).
+ */
+static u64 efer_mat_sentinel;
+static int efer_mat_stage;
+
+static void efer_mat_set_ctls(int stage)
+{
+	u64 ent = vmcs_read(ENT_CONTROLS) & ~ENT_LOAD_EFER;
+	u64 exi = vmcs_read(EXI_CONTROLS) & ~EXI_SAVE_EFER;
+
+	if (stage & 1)
+		ent |= ENT_LOAD_EFER;
+	if (stage & 2)
+		exi |= EXI_SAVE_EFER;
+	vmcs_write(ENT_CONTROLS, ent & ctrl_enter_rev.clr);
+	vmcs_write(EXI_CONTROLS, (exi | EXI_LOAD_EFER) & ctrl_exit_rev.clr);
+	/* valore valido per l'ingresso (LMA/LME invariati), diverso da quello
+	 * che L2 scrivera' (bit NX invertito) */
+	vmcs_write(GUEST_EFER, efer_mat_sentinel);
+}
+
+static int efer_mat_init(struct vmcs *vmcs)
+{
+	if (!(ctrl_enter_rev.clr & ENT_LOAD_EFER) ||
+	    !(ctrl_exit_rev.clr & EXI_SAVE_EFER) ||
+	    !(ctrl_exit_rev.clr & EXI_LOAD_EFER)) {
+		report_skip("%s : LOAD/SAVE EFER non supportati", __func__);
+		return VMX_TEST_EXIT;
+	}
+	msr_bmp_init();
+	ia32_efer = rdmsr(MSR_EFER);
+	efer_mat_sentinel = ia32_efer ^ EFER_NX;
+	vmcs_write(HOST_EFER, ia32_efer);
+	efer_mat_stage = 0;
+	efer_mat_set_ctls(0);
+	return VMX_TEST_START;
+}
+
+static void efer_mat_main(void)
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		wrmsr(MSR_EFER, ia32_efer);
+		vmcall();
+	}
+}
+
+static int efer_mat_exit_handler(union exit_reason exit_reason)
+{
+	u64 guest_rip = vmcs_read(GUEST_RIP);
+	u64 field = vmcs_read(GUEST_EFER);
+	int load = efer_mat_stage & 1, save = (efer_mat_stage >> 1) & 1;
+
+	if (exit_reason.basic != VMX_VMCALL) {
+		printf("ERROR : Unknown exit reason, 0x%x.\n", exit_reason.full);
+		return VMX_TEST_VMEXIT;
+	}
+	report(field == (save ? ia32_efer : efer_mat_sentinel),
+	    "EFER LOAD=%d SAVE=%d: GUEST_EFER=%lx atteso %lx", load, save,
+	    field, save ? ia32_efer : efer_mat_sentinel);
+	report(rdmsr(MSR_EFER) == ia32_efer,
+	    "EFER LOAD=%d SAVE=%d: EFER dell'L1 ripristinato", load, save);
+	vmcs_write(GUEST_RIP, guest_rip + 3);
+	if (++efer_mat_stage == 4)
+		return VMX_TEST_RESUME;
+	efer_mat_set_ctls(efer_mat_stage);
+	return VMX_TEST_RESUME;
+}
+
 u32 guest_cr0, guest_cr4;
 
 static void cr_shadowing_main(void)
@@ -9078,6 +9154,130 @@ static void vmx_pending_event_test_core(bool guest_hlt)
 	       "Guest finished running when no interrupt");
 }
 
+/*
+ * Claude 21/10/2026 (bhyve nested, parere #24 di Astra): interrupt dell'L1
+ * pendente mentre il VM-entry inietta un evento nell'L2. Sulla CPU vera
+ * (SDM 26.6/26.7, 22.6.4) l'evento iniettato viene consegnato e, con
+ * external-interrupt exiting, l'interrupt dell'L1 causa il VM-exit PRIMA
+ * della prima istruzione del gestore dell'L2: il gestore non gira e l'L2 non
+ * avanza. Un hypervisor che rimanda l'interrupt dell'L1 senza chiedere
+ * un'uscita immediata lascia invece correre l'L2 fino all'uscita naturale
+ * successiva. Con ept=true l'L2 usa EPT: la consegna puo' essere interrotta
+ * da EPT violation (shadow EPT di L0), e l'evento va reiniettato prima.
+ */
+static volatile bool l1l2_isr_ran;
+static volatile u64 l1l2_counter;
+static volatile bool l1l2_ipi_fired;
+
+static void l1l2_guest_isr(isr_regs_t *regs)
+{
+	l1l2_isr_ran = true;		/* evento iniettato: niente EOI */
+}
+
+static void l1l2_ipi_isr(isr_regs_t *regs)
+{
+	l1l2_ipi_fired = true;
+	eoi();
+}
+
+static void l1l2_guest(void)
+{
+	int i;
+
+	int k;
+
+	/* k=0 riscaldamento, k=1 collisione; poi ritorna (fine del guest) */
+	for (k = 0; k < 2; k++) {
+		for (i = 0; i < 1000000; i++)
+			l1l2_counter++;
+		vmcall();
+	}
+}
+
+static void vmx_l1_intr_vs_l2_injection_core(bool ept)
+{
+	int ipi_vector = 0xf1, inj_vector = 0x22;
+	u32 reason, idt;
+	u64 cnt;
+
+	if (ept && setup_ept(false)) {
+		report_skip("%s : EPT non disponibile", __func__);
+		return;
+	}
+	l1l2_isr_ran = false;
+	l1l2_counter = 0;
+	l1l2_ipi_fired = false;
+	handle_irq(inj_vector, l1l2_guest_isr);
+	handle_irq(ipi_vector, l1l2_ipi_isr);
+	test_set_guest(l1l2_guest);
+	vmcs_set_bits(PIN_CONTROLS, PIN_EXTINT);
+	vmcs_clear_bits(EXI_CONTROLS, EXI_INTA);
+	/* iniettare un interrupt esterno vuole RFLAGS.IF=1 nell'L2 (SDM 26.3.1.5) */
+	vmcs_write(GUEST_RFLAGS, vmcs_read(GUEST_RFLAGS) | X86_EFLAGS_IF);
+
+	/*
+	 * Riscaldamento: lo stesso percorso (iniezione, gestore, ciclo) SENZA
+	 * interrupt dell'L1 pendente. Con EPT riempie la shadow EPT di L0
+	 * (IDT, stack, codice del gestore): senza, la prima istruzione del
+	 * gestore farebbe una EPT violation e l'uscita arriverebbe "per caso".
+	 */
+	vmcs_write(ENT_INTR_INFO, INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR |
+	    inj_vector);
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+	report(l1l2_isr_ran && l1l2_counter == 1000000,
+	    "%s: riscaldamento (contatore=%lu)", ept ? "EPT" : "no-EPT",
+	    l1l2_counter);
+	l1l2_isr_ran = false;
+	l1l2_counter = 0;
+	vmcs_write(GUEST_RFLAGS, vmcs_read(GUEST_RFLAGS) | X86_EFLAGS_IF);
+
+	cli();
+	apic_icr_write(APIC_DEST_SELF | APIC_DEST_PHYSICAL | APIC_DM_FIXED |
+	    ipi_vector, 0);
+	vmcs_write(ENT_INTR_INFO, INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR |
+	    inj_vector);
+	enter_guest();
+
+	reason = vmcs_read(EXI_REASON) & 0xffff;
+	idt = vmcs_read(IDT_VECT_INFO);
+	cnt = l1l2_counter;
+	report(reason == VMX_EXTINT, "%s: uscita EXTERNAL_INTERRUPT (motivo %d)",
+	    ept ? "EPT" : "no-EPT", reason);
+	report(!(idt & INTR_INFO_VALID_MASK),
+	    "%s: evento dell'L2 consegnato, IDT-vectoring non valido (%x)",
+	    ept ? "EPT" : "no-EPT", idt);
+	report(!l1l2_isr_ran && cnt == 0,
+	    "%s: l'L2 non e' avanzato prima dell'uscita (isr=%d contatore=%lu)",
+	    ept ? "EPT" : "no-EPT", l1l2_isr_ran, cnt);
+
+	sti_nop_cli();
+	report(l1l2_ipi_fired, "%s: l'interrupt dell'L1 arriva all'L1",
+	    ept ? "EPT" : "no-EPT");
+
+	/* l'L2 riprende dal gestore dell'evento consegnato e finisce */
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+	report(l1l2_isr_ran && l1l2_counter == 1000000,
+	    "%s: poi l'L2 esegue il gestore e finisce (contatore=%lu)",
+	    ept ? "EPT" : "no-EPT", l1l2_counter);
+	handle_irq(inj_vector, NULL);
+	handle_irq(ipi_vector, NULL);
+	enter_guest();			/* il guest ritorna: test completo */
+}
+
+static void vmx_l1_intr_vs_l2_injection_test(void)
+{
+	vmx_l1_intr_vs_l2_injection_core(false);
+}
+
+static void vmx_l1_intr_vs_l2_injection_ept_test(void)
+{
+	vmx_l1_intr_vs_l2_injection_core(true);
+}
+
 static void vmx_pending_event_test(void)
 {
 	vmx_pending_event_test_core(false);
@@ -12096,6 +12296,8 @@ struct vmx_test vmx_tests[] = {
 		test_ctrl_pat_exit_handler },
 	{ "control field EFER", test_ctrl_efer_init, test_ctrl_efer_main,
 		test_ctrl_efer_exit_handler },
+	{ "EFER save matrix", efer_mat_init, efer_mat_main,
+		efer_mat_exit_handler },
 	{ "CR shadowing", NULL, cr_shadowing_main, cr_shadowing_exit_handler },
 	{ "I/O bitmap", iobmp_init, iobmp_main, iobmp_exit_handler },
 	{ "instruction intercept", insn_intercept_init, insn_intercept_main,
@@ -12153,6 +12355,8 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_nmi_window_test),
 	TEST(vmx_intr_window_test),
 	TEST(vmx_pending_event_test),
+	TEST(vmx_l1_intr_vs_l2_injection_test),
+	TEST(vmx_l1_intr_vs_l2_injection_ept_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
