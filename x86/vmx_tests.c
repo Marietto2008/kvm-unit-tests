@@ -9383,6 +9383,352 @@ static void vmx_invept_selective_test(void)
 	enter_guest();			/* il guest ritorna: test completo */
 }
 
+/*
+ * Claude 21/10/2026 (bhyve nested, pareri #26 e #27 di Astra): test per B1,
+ * cioe' per una shadow EPT che CONSERVA le traduzioni non cambiate oltre
+ * l'INVEPT. Qui si verifica solo la semantica architetturale (dopo un INVEPT
+ * single-context l'L2 vede l'EPT12 corrente; le voci non cambiate restano
+ * corrette): passano anche con un hypervisor che svuota tutto a ogni INVEPT.
+ * L'L2 legge davvero le pagine; ogni pagina ha un'etichetta (regione, indice).
+ */
+#define	B1_OP_EXIT	0
+#define	B1_OP_READ	1	/* leggi b1_n indirizzi in b1_val */
+#define	B1_OP_WRITE	2	/* scrivi b1_wval in b1_addr[0] */
+#define	B1_OP_VERIFY	3	/* confronta b1_n indirizzi con b1_exp */
+#define	B1_MAXN		1024
+static volatile int b1_op, b1_n;
+static volatile u64 b1_addr[B1_MAXN], b1_val[B1_MAXN], b1_exp[B1_MAXN];
+static volatile u64 b1_wval, b1_mism;
+
+static void b1_guest(void)
+{
+	int i;
+
+	for (;;) {
+		switch (b1_op) {
+		case B1_OP_EXIT:
+			return;
+		case B1_OP_READ:
+			for (i = 0; i < b1_n; i++)
+				b1_val[i] = *(volatile u64 *)b1_addr[i];
+			break;
+		case B1_OP_WRITE:
+			*(volatile u64 *)b1_addr[0] = b1_wval;
+			break;
+		case B1_OP_VERIFY:
+			b1_mism = 0;
+			for (i = 0; i < b1_n; i++)
+				if (*(volatile u64 *)b1_addr[i] != b1_exp[i])
+					b1_mism++;
+			break;
+		}
+		vmcall();
+	}
+}
+
+/* esegue un'operazione dell'L2 e si aspetta una VMCALL */
+static void b1_do(int op)
+{
+	b1_op = op;
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+}
+
+static void b1_tag(void *region, int npages, u64 tag)
+{
+	int j;
+
+	for (j = 0; j < npages; j++)
+		*(volatile u64 *)((char *)region + j * PAGE_SIZE) =
+		    (tag << 32) | j;
+}
+
+static u64 b1_tagof(u64 tag, int j)
+{
+	return ((tag << 32) | j);
+}
+
+static bool b1_read1(void *a, u64 want)
+{
+	b1_addr[0] = (u64)a;
+	b1_n = 1;
+	b1_do(B1_OP_READ);
+	return (b1_val[0] == want);
+}
+
+static void vmx_ept_b1_test(void)
+{
+	char *rg_r, *rg_s, *rg_u, *rg_t;
+	unsigned long pde, *pd, *pd2, pdpte;
+	u64 q;
+	bool ok;
+	int i;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	rg_r = alloc_pages(9);		/* 2 MiB, allineate */
+	rg_s = alloc_pages(9);
+	rg_u = alloc_pages(9);
+	rg_t = alloc_pages(9);
+	b1_tag(rg_r, 512, 1); b1_tag(rg_s, 512, 2); b1_tag(rg_u, 512, 3); b1_tag(rg_t, 512, 4);
+	test_set_guest(b1_guest);
+
+	/* 1. due PTE nella stessa tabella, cambia solo A */
+	install_ept(pml4, (unsigned long)rg_r, (unsigned long)rg_r, EPT_PRESENT);
+	install_ept(pml4, (unsigned long)rg_r + PAGE_SIZE,
+	    (unsigned long)rg_r + PAGE_SIZE, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	ok = b1_read1(rg_r, b1_tagof(1, 0)) && b1_read1(rg_r + PAGE_SIZE, b1_tagof(1, 1));
+	install_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	ok = ok && b1_read1(rg_r, b1_tagof(2, 0)) &&
+	    b1_read1(rg_r + PAGE_SIZE, b1_tagof(1, 1));
+	report(ok, "B1: due PTE nella stessa tabella, cambia solo A");
+
+	/* 2. controesempio del parere #25: modifica B, walk su C della stessa
+	 * tabella, INVEPT, accesso a B */
+	install_ept(pml4, (unsigned long)rg_s + PAGE_SIZE,
+	    (unsigned long)rg_r + PAGE_SIZE, EPT_PRESENT);
+	ok = b1_read1(rg_r + 2 * PAGE_SIZE, b1_tagof(1, 2));
+	invept(INVEPT_SINGLE, eptp);
+	ok = ok && b1_read1(rg_r + PAGE_SIZE, b1_tagof(2, 1));
+	report(ok, "B1: modifica, walk su un'altra voce, INVEPT: vista la nuova");
+
+	/* 3a. riduzione dei permessi: A in sola lettura, la scrittura dell'L2
+	 * deve uscire con EPT violation verso l'L1 */
+	install_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r,
+	    EPT_PRESENT & ~EPT_WA);
+	invept(INVEPT_SINGLE, eptp);
+	b1_addr[0] = (u64)rg_r;
+	b1_wval = b1_tagof(2, 0);
+	b1_op = B1_OP_WRITE;
+	enter_guest();
+	q = vmcs_read(EXI_QUALIFICATION);
+	ok = (vmcs_read(EXI_REASON) & 0xffff) == VMX_EPT_VIOLATION &&
+	    (q & 2) != 0 && vmcs_read(INFO_PHYS_ADDR) == (u64)rg_r;
+	report(ok, "B1: permesso W tolto: EPT violation in scrittura (qual %lx)",
+	    q);
+	/* 3b. permesso restituito, si riprende la scrittura */
+	install_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+	report(b1_read1(rg_r, b1_tagof(2, 0)), "B1: permesso restituito");
+	/* 3c. voce tolta del tutto: la lettura esce */
+	install_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r, 0);
+	invept(INVEPT_SINGLE, eptp);
+	b1_addr[0] = (u64)rg_r; b1_n = 1; b1_op = B1_OP_READ;
+	enter_guest();
+	ok = (vmcs_read(EXI_REASON) & 0xffff) == VMX_EPT_VIOLATION &&
+	    vmcs_read(INFO_PHYS_ADDR) == (u64)rg_r;
+	report(ok, "B1: voce tolta: EPT violation in lettura");
+	install_ept(pml4, (unsigned long)rg_r, (unsigned long)rg_r, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+	report(b1_val[0] == b1_tagof(1, 0), "B1: voce rimessa");
+
+	/* 4. PDE: rg_r (tabella di 4K) diventa una pagina da 2 MiB su rg_s */
+	b1_addr[0] = (u64)rg_r; b1_addr[1] = (u64)rg_r + 511 * PAGE_SIZE; b1_n = 2;
+	b1_do(B1_OP_READ);
+	ok = b1_val[0] == b1_tagof(1, 0) && b1_val[1] == b1_tagof(1, 511);
+	install_2m_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	b1_do(B1_OP_READ);
+	ok = ok && b1_val[0] == b1_tagof(2, 0) && b1_val[1] == b1_tagof(2, 511);
+	report(ok, "B1: PDE cambiata (PT -> 2 MiB): tutto l'intervallo nuovo");
+	/* 4b. dimensione della pagina: si torna a una tabella di 4K identita' */
+	install_ept(pml4, (unsigned long)rg_r, (unsigned long)rg_r, EPT_PRESENT);
+	for (i = 1; i < 512; i++)
+		install_ept(pml4, (unsigned long)rg_r + i * PAGE_SIZE,
+		    (unsigned long)rg_r + i * PAGE_SIZE, EPT_PRESENT);
+	invept(INVEPT_SINGLE, eptp);
+	b1_do(B1_OP_READ);
+	report(b1_val[0] == b1_tagof(1, 0) && b1_val[1] == b1_tagof(1, 511),
+	    "B1: page size cambiata (2 MiB -> PT)");
+
+	/* 5. PDPTE: la PD di questo GiB sostituita da una copia in cui la PDE
+	 * di rg_r punta a rg_s da 2 MiB; rg_t, nello stesso GiB, resta com'era */
+	if (((unsigned long)rg_r >> 30) == ((unsigned long)rg_t >> 30) &&
+	    get_ept_pte(pml4, (unsigned long)rg_r, 3, &pdpte) &&
+	    !(pdpte & EPT_LARGE_PAGE)) {
+		pd = (unsigned long *)(pdpte & EPT_ADDR_MASK);
+		pd2 = alloc_page();
+		memcpy(pd2, pd, PAGE_SIZE);
+		pd2[((unsigned long)rg_r >> 21) & 511] = ((unsigned long)rg_s &
+		    EPT_ADDR_MASK) | EPT_PRESENT | EPT_LARGE_PAGE;
+		b1_addr[0] = (u64)rg_r; b1_addr[1] = (u64)rg_t; b1_n = 2;
+		b1_do(B1_OP_READ);
+		set_ept_pte(pml4, (unsigned long)rg_r, 3,
+		    virt_to_phys(pd2) | (pdpte & ~EPT_ADDR_MASK));
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_READ);
+		ok = b1_val[0] == b1_tagof(2, 0) && b1_val[1] == b1_tagof(4, 0);
+		report(ok, "B1: PDPTE cambiata: R nuova, T nello stesso GiB intatta");
+		set_ept_pte(pml4, (unsigned long)rg_r, 3, pdpte);	/* ripristino */
+		invept(INVEPT_SINGLE, eptp);
+	} else
+		report_skip("B1: PDPTE (R e T non nello stesso GiB)");
+
+	/* 6. una tabella EPT12 raggiunta da due basi: la PDE di rg_u punta alla
+	 * stessa PT di rg_r; cambia una sua voce: entrambe le basi la vedono */
+	if (get_ept_pte(pml4, (unsigned long)rg_r, 2, &pde) &&
+	    !(pde & EPT_LARGE_PAGE)) {
+		unsigned long upde;
+
+		get_ept_pte(pml4, (unsigned long)rg_u, 2, &upde);
+		set_ept_pte(pml4, (unsigned long)rg_u, 2, pde);
+		invept(INVEPT_SINGLE, eptp);
+		b1_addr[0] = (u64)rg_r; b1_addr[1] = (u64)rg_u; b1_n = 2;
+		b1_do(B1_OP_READ);
+		ok = b1_val[0] == b1_tagof(1, 0) && b1_val[1] == b1_tagof(1, 0);
+		install_ept(pml4, (unsigned long)rg_s, (unsigned long)rg_r, EPT_PRESENT);
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_READ);
+		ok = ok && b1_val[0] == b1_tagof(2, 0) &&
+		    b1_val[1] == b1_tagof(2, 0);
+		report(ok, "B1: tabella condivisa da due basi: entrambe aggiornate");
+		set_ept_pte(pml4, (unsigned long)rg_u, 2, upde);
+		install_ept(pml4, (unsigned long)rg_r, (unsigned long)rg_r, EPT_PRESENT);
+		invept(INVEPT_SINGLE, eptp);
+	} else
+		report_skip("B1: due basi (PDE di R non e' una tabella)");
+
+	/* 7. INVEPT senza modifiche: tutto resta corretto */
+	for (i = 0; i < 64; i++) {
+		b1_addr[i] = (u64)rg_r + i * PAGE_SIZE * 8;
+		b1_exp[i] = b1_tagof(1, i * 8);
+	}
+	b1_n = 64;
+	b1_do(B1_OP_VERIFY);
+	invept(INVEPT_SINGLE, eptp);
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1: INVEPT senza modifiche (discordanze %lu)",
+	    b1_mism);
+
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
+/*
+ * Persistenza lunga (parere #27 §6): 1000 pagine, molti INVEPT, a ogni giro
+ * una modifica diversa (cambio di HPA, ripristino, W tolto con uscita attesa
+ * e restituito, INVEPT senza modifiche, PDE cambiata e ripristinata). A ogni
+ * giro l'L2 confronta tutte le 1000 pagine col valore atteso.
+ */
+#define	B1P_N		1000
+#define	B1P_ITER	10000
+static void vmx_ept_b1_persist_test(void)
+{
+	char *rg_p, *rg_q;
+	int k, i, j, bad = 0, viol = 0, nvio = 0;
+	u64 q;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	rg_p = alloc_pages(10);		/* 1024 pagine */
+	rg_q = alloc_pages(10);
+	b1_tag(rg_p, 1024, 5); b1_tag(rg_q, 1024, 6);
+	for (j = 0; j < B1P_N; j++) {
+		install_ept(pml4, (unsigned long)rg_p + j * PAGE_SIZE,
+		    (unsigned long)rg_p + j * PAGE_SIZE, EPT_PRESENT);
+		b1_addr[j] = (u64)rg_p + j * PAGE_SIZE;
+		b1_exp[j] = b1_tagof(5, j);
+	}
+	b1_n = B1P_N;
+	invept(INVEPT_SINGLE, eptp);
+	test_set_guest(b1_guest);
+	b1_do(B1_OP_VERIFY);
+	bad += b1_mism != 0;
+
+	for (k = 0; k < B1P_ITER; k++) {
+		i = (k * 37) % B1P_N;
+		switch (k % 5) {
+		case 0:		/* cambio di HPA */
+			install_ept(pml4, (unsigned long)rg_q + i * PAGE_SIZE,
+			    (unsigned long)rg_p + i * PAGE_SIZE, EPT_PRESENT);
+			b1_exp[i] = b1_tagof(6, i);
+			break;
+		case 1:		/* ripristino */
+			install_ept(pml4, (unsigned long)rg_p + i * PAGE_SIZE,
+			    (unsigned long)rg_p + i * PAGE_SIZE, EPT_PRESENT);
+			b1_exp[i] = b1_tagof(5, i);
+			break;
+		case 2:		/* W tolto: la scrittura deve uscire */
+			install_ept(pml4, (b1_exp[i] >> 32) == 6 ?
+			    (unsigned long)rg_q + i * PAGE_SIZE :
+			    (unsigned long)rg_p + i * PAGE_SIZE,
+			    (unsigned long)rg_p + i * PAGE_SIZE,
+			    EPT_PRESENT & ~EPT_WA);
+			invept(INVEPT_SINGLE, eptp);
+			b1_addr[0] = (u64)rg_p + i * PAGE_SIZE;
+			b1_wval = b1_exp[i];
+			b1_op = B1_OP_WRITE;
+			enter_guest();
+			q = vmcs_read(EXI_QUALIFICATION);
+			nvio++;
+			if ((vmcs_read(EXI_REASON) & 0xffff) == VMX_EPT_VIOLATION &&
+			    (q & 2) && vmcs_read(INFO_PHYS_ADDR) ==
+			    (u64)rg_p + i * PAGE_SIZE)
+				viol++;
+			install_ept(pml4, (b1_exp[i] >> 32) == 6 ?
+			    (unsigned long)rg_q + i * PAGE_SIZE :
+			    (unsigned long)rg_p + i * PAGE_SIZE,
+			    (unsigned long)rg_p + i * PAGE_SIZE, EPT_PRESENT);
+			invept(INVEPT_SINGLE, eptp);
+			if ((vmcs_read(EXI_REASON) & 0xffff) == VMX_EPT_VIOLATION) {
+				enter_guest();		/* riprende la scrittura */
+				assert_exit_reason(VMX_VMCALL);
+			}
+			skip_exit_vmcall();
+			b1_addr[0] = (u64)rg_p;		/* ripristina la lista */
+			break;
+		case 3:		/* nessuna modifica */
+			break;
+		case 4:		/* ogni 50 giri: la PDE del primo blocco da
+				 * 2 MiB diventa 2 MiB su rg_q e poi torna PT */
+			if (k % 50 == 4) {
+				install_2m_ept(pml4, (unsigned long)rg_q,
+				    (unsigned long)rg_p, EPT_PRESENT);
+				for (j = 0; j < 512; j++)
+					b1_exp[j] = b1_tagof(6, j);
+				invept(INVEPT_SINGLE, eptp);
+				b1_do(B1_OP_VERIFY);
+				bad += b1_mism != 0;
+				for (j = 0; j < 512; j++) {
+					install_ept(pml4, (unsigned long)rg_p +
+					    j * PAGE_SIZE, (unsigned long)rg_p +
+					    j * PAGE_SIZE, EPT_PRESENT);
+					b1_exp[j] = b1_tagof(5, j);
+				}
+			}
+			break;
+		}
+		invept(INVEPT_SINGLE, eptp);
+		b1_n = B1P_N;
+		b1_do(B1_OP_VERIFY);
+		if (b1_mism != 0) {
+			if (bad < 5)
+				printf("giro %d (op %d, pagina %d): %lu discordanze\n",
+				    k, k % 5, i, b1_mism);
+			bad++;
+		}
+	}
+	report(bad == 0, "B1 persistenza: %d giri su %d pagine, giri con discordanze %d",
+	    B1P_ITER, B1P_N, bad);
+	report(viol == nvio, "B1 persistenza: W tolto -> EPT violation %d/%d",
+	    viol, nvio);
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
 static void vmx_pending_event_test(void)
 {
 	vmx_pending_event_test_core(false);
@@ -12463,6 +12809,8 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_l1_intr_vs_l2_injection_test),
 	TEST(vmx_l1_intr_vs_l2_injection_ept_test),
 	TEST(vmx_invept_selective_test),
+	TEST(vmx_ept_b1_test),
+	TEST(vmx_ept_b1_persist_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
