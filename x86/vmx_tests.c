@@ -9729,6 +9729,158 @@ static void vmx_ept_b1_persist_test(void)
 	enter_guest();
 }
 
+/*
+ * Claude 21/10/2026 (bhyve nested, parere #27 di Astra §5): T2, scritture
+ * dell'EPT12 da un ALTRO processore logico dell'L1 mentre il BSP esegue
+ * INVEPT ed entra in L2. Variante sincronizzata (decisiva): il secondo LP
+ * cambia una PTE e lo segnala; il BSP, visto il segnale, fa INVEPT ed entra:
+ * l'L2 deve vedere la modifica. Variante non sincronizzata (robustezza): il
+ * secondo LP alterna di continuo 8 PTE fra due pagine; ogni lettura dell'L2
+ * deve dare l'una o l'altra, mai altro, e le altre pagine restano esatte.
+ */
+static volatile int b1c_req, b1c_done, b1c_stop, b1c_mode, b1c_stopped;
+static volatile u64 *b1c_pte[512];
+static u64 b1c_pteP[512], b1c_pteQ[512];
+
+static volatile u64 *b1_pte_ptr(unsigned long *root, unsigned long gpa)
+{
+	unsigned long *pt = root;
+	int l;
+
+	for (l = EPT_PAGE_LEVEL; l > 1; l--) {
+		u64 e = pt[(gpa >> EPT_LEVEL_SHIFT(l)) & EPT_PGDIR_MASK];
+
+		assert((e & EPT_PRESENT) && !(e & EPT_LARGE_PAGE));
+		pt = phys_to_virt(e & EPT_ADDR_MASK);
+	}
+	return ((volatile u64 *)&pt[(gpa >> EPT_LEVEL_SHIFT(1)) & EPT_PGDIR_MASK]);
+}
+
+static void b1c_cpu1(void *data)
+{
+	int r, j, k = 0;
+
+	while (!b1c_stop) {
+		if (b1c_mode == 1) {		/* sincronizzata */
+			r = b1c_req;
+			if (r != b1c_done) {
+				j = r % 512;
+				*b1c_pte[j] = (*b1c_pte[j] == b1c_pteP[j]) ?
+				    b1c_pteQ[j] : b1c_pteP[j];
+				smp_wmb();
+				b1c_done = r;
+			}
+		} else if (b1c_mode == 2) {	/* non sincronizzata */
+			j = (k++ % 8) * 61;
+			*b1c_pte[j] = (*b1c_pte[j] == b1c_pteP[j]) ?
+			    b1c_pteQ[j] : b1c_pteP[j];
+		}
+		pause();
+	}
+	b1c_stopped = 1;
+}
+
+#define	B1C_ROUNDS	2000
+static void vmx_ept_b1_conc_test(void)
+{
+	char *rg_p, *rg_q;
+	int r, j, bad_sync = 0, bad_unsync = 0, odd = 0, seen7 = 0, seen8 = 0;
+
+	if (cpu_count() < 2) {
+		report_skip("%s : serve un secondo processore", __func__);
+		return;
+	}
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	rg_p = alloc_pages(9);
+	rg_q = alloc_pages(9);
+	b1_tag(rg_p, 512, 7); b1_tag(rg_q, 512, 8);
+	for (j = 0; j < 512; j++) {
+		install_ept(pml4, (unsigned long)rg_p + j * PAGE_SIZE,
+		    (unsigned long)rg_p + j * PAGE_SIZE, EPT_PRESENT);
+		b1c_pte[j] = b1_pte_ptr(pml4, (unsigned long)rg_p + j * PAGE_SIZE);
+		b1c_pteP[j] = *b1c_pte[j];
+		b1c_pteQ[j] = (b1c_pteP[j] & ~EPT_ADDR_MASK) |
+		    (((unsigned long)rg_q + j * PAGE_SIZE) & EPT_ADDR_MASK);
+		b1_addr[j] = (u64)rg_p + j * PAGE_SIZE;
+		b1_exp[j] = b1_tagof(7, j);
+	}
+	invept(INVEPT_SINGLE, eptp);
+	test_set_guest(b1_guest);
+	b1_n = 512;
+	b1_do(B1_OP_VERIFY);
+
+	b1c_stop = 0; b1c_stopped = 0; b1c_req = 0; b1c_done = 0; b1c_mode = 1;
+	on_cpu_async(1, b1c_cpu1, NULL);
+
+	/* sincronizzata: il secondo LP cambia, segnala; poi INVEPT e verifica */
+	for (r = 1; r <= B1C_ROUNDS; r++) {
+		j = r % 512;
+		b1c_req = r;
+		while (b1c_done != r)
+			pause();
+		smp_rmb();
+		b1_exp[j] = (*b1c_pte[j] == b1c_pteQ[j]) ? b1_tagof(8, j) :
+		    b1_tagof(7, j);
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_VERIFY);
+		if (b1_mism != 0) {
+			if (bad_sync < 5)
+				printf("sincronizzata, giro %d: %lu discordanze\n",
+				    r, b1_mism);
+			bad_sync++;
+		}
+	}
+	report(bad_sync == 0,
+	    "B1 T2: modifiche da un altro LP ordinate prima dell'INVEPT: %d giri, discordanze %d",
+	    B1C_ROUNDS, bad_sync);
+
+	/* non sincronizzata: il secondo LP alterna 8 PTE di continuo */
+	b1c_mode = 2;
+	for (r = 0; r < B1C_ROUNDS; r++) {
+		invept(INVEPT_SINGLE, eptp);
+		b1_n = 512;
+		b1_do(B1_OP_READ);
+		for (j = 0; j < 512; j++) {
+			bool altern = (j % 61) == 0 && j / 61 < 8;
+
+			if (altern) {
+				if (b1_val[j] == b1_tagof(7, j))
+					seen7++;
+				else if (b1_val[j] == b1_tagof(8, j))
+					seen8++;
+				else
+					odd++;
+			} else if (b1_val[j] != b1_exp[j])
+				bad_unsync++;
+		}
+	}
+	b1c_stop = 1;
+	while (!b1c_stopped)
+		pause();
+	report(odd == 0 && bad_unsync == 0,
+	    "B1 T2: scritture concorrenti non sincronizzate: valori estranei %d, pagine non toccate sbagliate %d",
+	    odd, bad_unsync);
+	/* il test vale solo se l'L2 ha visto davvero entrambe le versioni */
+	report(seen7 > 0 && seen8 > 0,
+	    "B1 T2: l'L2 ha visto entrambe le versioni delle PTE alternate (%d/%d)",
+	    seen7, seen8);
+
+	/* a scritture ferme: INVEPT, poi tutto coerente con l'EPT12 finale */
+	for (j = 0; j < 512; j++)
+		b1_exp[j] = (*b1c_pte[j] == b1c_pteQ[j]) ? b1_tagof(8, j) :
+		    b1_tagof(7, j);
+	invept(INVEPT_SINGLE, eptp);
+	b1_n = 512;
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1 T2: dopo l'ultimo INVEPT tutto coerente (discordanze %lu)",
+	    b1_mism);
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
 static void vmx_pending_event_test(void)
 {
 	vmx_pending_event_test_core(false);
@@ -12811,6 +12963,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_invept_selective_test),
 	TEST(vmx_ept_b1_test),
 	TEST(vmx_ept_b1_persist_test),
+	TEST(vmx_ept_b1_conc_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
