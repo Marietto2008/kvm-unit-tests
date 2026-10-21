@@ -9730,6 +9730,61 @@ static void vmx_ept_b1_persist_test(void)
 }
 
 /*
+ * Claude 21/10/2026 (parere #28 di Astra, §4): prova d'iniezione della
+ * generazione dei mapping di L0. Stampa "B1MG: pronto" e per circa B1MG_CYC
+ * cicli di TSC ripete INVEPT senza modifiche + verifica delle 1000 pagine
+ * dall'L2; nel frattempo l'host fa avanzare UNA volta la generazione
+ * (tools/nested/memgen-bump, vCPU fermi). Qui si verifica che le traduzioni
+ * restino giuste; che la radice shadow sia stata svuotata prima del primo
+ * ingresso successivo e poi ricostruita lo dicono i contatori dell'host
+ * (hw.vmm.vmx.vept_memgen_*, vept_stale_root_enters) e la sonda veptmemgen.
+ */
+#define	B1MG_CYC	(40ULL * 1000 * 1000 * 1000)	/* ~12 s a 3,3 GHz */
+static void vmx_ept_b1_memgen_test(void)
+{
+	char *rg_p;
+	int j, bad = 0;
+	u64 t0, giri = 0;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	rg_p = alloc_pages(10);		/* 1024 pagine */
+	b1_tag(rg_p, 1024, 7);
+	for (j = 0; j < B1P_N; j++) {
+		install_ept(pml4, (unsigned long)rg_p + j * PAGE_SIZE,
+		    (unsigned long)rg_p + j * PAGE_SIZE, EPT_PRESENT);
+		b1_addr[j] = (u64)rg_p + j * PAGE_SIZE;
+		b1_exp[j] = b1_tagof(7, j);
+	}
+	b1_n = B1P_N;
+	invept(INVEPT_SINGLE, eptp);
+	test_set_guest(b1_guest);
+	b1_do(B1_OP_VERIFY);
+	bad += b1_mism != 0;
+	printf("B1MG: pronto\n");
+	t0 = rdtsc();
+	while (rdtsc() - t0 < B1MG_CYC) {
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_VERIFY);
+		if (b1_mism != 0) {
+			if (bad < 5)
+				printf("giro %lu: %lu discordanze\n", giri,
+				    b1_mism);
+			bad++;
+		}
+		giri++;
+	}
+	printf("B1MG: fine\n");
+	report(bad == 0 && giri > 0,
+	    "B1 generazione: %lu giri su %d pagine, giri con discordanze %d",
+	    giri, B1P_N, bad);
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
+/*
  * Claude 21/10/2026 (bhyve nested, parere #27 di Astra §5): T2, scritture
  * dell'EPT12 da un ALTRO processore logico dell'L1 mentre il BSP esegue
  * INVEPT ed entra in L2. Variante sincronizzata (decisiva): il secondo LP
@@ -12964,6 +13019,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_ept_b1_test),
 	TEST(vmx_ept_b1_persist_test),
 	TEST(vmx_ept_b1_conc_test),
+	TEST(vmx_ept_b1_memgen_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
