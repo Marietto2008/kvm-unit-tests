@@ -9278,6 +9278,111 @@ static void vmx_l1_intr_vs_l2_injection_ept_test(void)
 	vmx_l1_intr_vs_l2_injection_core(true);
 }
 
+/*
+ * Claude 21/10/2026 (bhyve nested, parere #24 di Astra): INVEPT single-context
+ * selettivo con due EPT12 distinti, A e B. SDM: single-context invalida le
+ * traduzioni associate ai bit 51:12 dell'EPTP (non all'EPTP intero), quindi un
+ * EPTP con la stessa base di A e attributi diversi deve invalidare A.
+ * All-context le invalida tutte. Un hypervisor annidato con shadow EPT che
+ * confronta l'EPTP intero lascerebbe A stantia.
+ */
+static unsigned long *invsel_pml4b;
+static void *invsel_p1, *invsel_p2;
+static volatile u64 invsel_seen;
+
+static void invsel_guest(void)
+{
+	int k;
+
+	for (k = 0; k < 6; k++) {
+		invsel_seen = *(volatile u64 *)invsel_p1;
+		vmcall();
+	}
+}
+
+static u64 invsel_eptp(unsigned long *root, u64 memtype)
+{
+	return (memtype | (3ul << EPTP_PG_WALK_LEN_SHIFT) | virt_to_phys(root));
+}
+
+static void invsel_run(u64 e)
+{
+	vmcs_write(EPTP, e);
+	invsel_seen = 0;
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+}
+
+static void vmx_invept_selective_test(void)
+{
+	unsigned long end_of_memory, *pml4c;
+	u64 a, b, a_uc;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) ||
+	    !is_invept_type_supported(INVEPT_GLOBAL) ||
+	    !is_ept_memtype_supported(EPT_MEM_TYPE_UC)) {
+		report_skip("%s : INVEPT single/global o memtype UC assenti",
+		    __func__);
+		return;
+	}
+	if (setup_ept(false)) {
+		report_skip("%s : EPT non disponibile", __func__);
+		return;
+	}
+	end_of_memory = fwcfg_get_u64(FW_CFG_RAM_SIZE);
+	if (end_of_memory < (1ul << 32))
+		end_of_memory = (1ul << 32);
+	invsel_pml4b = alloc_page();
+	setup_ept_range(invsel_pml4b, 0, end_of_memory, 0, ept_2m_supported(),
+	    EPT_PRESENT);
+	pml4c = alloc_page();		/* radice mai usata da un VMCS */
+	invsel_p1 = alloc_page();
+	invsel_p2 = alloc_page();
+	*(volatile u64 *)invsel_p1 = 0x1111;
+	*(volatile u64 *)invsel_p2 = 0x2222;
+	a = eptp;			/* da setup_ept: WB, 4 livelli */
+	b = invsel_eptp(invsel_pml4b, EPT_MEM_TYPE_WB);
+	a_uc = (a & ~0x7ul) | EPT_MEM_TYPE_UC;
+	test_set_guest(invsel_guest);
+
+	invsel_run(a);
+	report(invsel_seen == 0x1111, "INVEPT: A popolata (%lx)", invsel_seen);
+	invsel_run(b);
+	report(invsel_seen == 0x1111, "INVEPT: B popolata (%lx)", invsel_seen);
+
+	/* A: p1 -> p2; single-context con la base di A ma memtype UC */
+	install_ept(pml4, (unsigned long)invsel_p2, (unsigned long)invsel_p1,
+	    EPT_PRESENT);
+	invept(INVEPT_SINGLE, a_uc);
+	invsel_run(a);
+	report(invsel_seen == 0x2222,
+	    "INVEPT single, stessa base e attributi diversi: A invalidata (%lx)",
+	    invsel_seen);
+	invsel_run(b);
+	report(invsel_seen == 0x1111, "INVEPT single: B corretta (%lx)",
+	    invsel_seen);
+
+	/* single-context di un EPTP che nessun VMCS ha usato: successo */
+	invept(INVEPT_SINGLE, invsel_eptp(pml4c, EPT_MEM_TYPE_WB));
+	report(true, "INVEPT single di un EPTP mai usato: successo");
+
+	/* A: p1 -> p1, B: p1 -> p2; all-context le invalida entrambe */
+	install_ept(pml4, (unsigned long)invsel_p1, (unsigned long)invsel_p1,
+	    EPT_PRESENT);
+	install_ept(invsel_pml4b, (unsigned long)invsel_p2,
+	    (unsigned long)invsel_p1, EPT_PRESENT);
+	invept(INVEPT_GLOBAL, 0);
+	invsel_run(a);
+	report(invsel_seen == 0x1111, "INVEPT all-context: A invalidata (%lx)",
+	    invsel_seen);
+	invsel_run(b);
+	report(invsel_seen == 0x2222, "INVEPT all-context: B invalidata (%lx)",
+	    invsel_seen);
+	vmcs_write(EPTP, a);
+	enter_guest();			/* il guest ritorna: test completo */
+}
+
 static void vmx_pending_event_test(void)
 {
 	vmx_pending_event_test_core(false);
@@ -12357,6 +12462,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_pending_event_test),
 	TEST(vmx_l1_intr_vs_l2_injection_test),
 	TEST(vmx_l1_intr_vs_l2_injection_ept_test),
+	TEST(vmx_invept_selective_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
