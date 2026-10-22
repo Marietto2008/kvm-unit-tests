@@ -9827,6 +9827,7 @@ static void vmx_ept_b1_race_test(void)
 	    "B1 corsa: nessuna EPT violation ingiustificata (%d, %d)",
 	    spurious, b1r_badforeign);
 	report(nro > 0, "B1 corsa: iniezioni viste dall'L1 (%d)", nro);
+	b1_addr[0] = (u64)rg_p;		/* la scrittura usa b1_addr[0] */
 	b1_n = B1R_N;
 	b1_do(B1_OP_VERIFY);
 	report(b1_mism == 0, "B1 corsa: contenuto delle pagine intatto (%lu)",
