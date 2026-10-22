@@ -9730,6 +9730,112 @@ static void vmx_ept_b1_persist_test(void)
 }
 
 /*
+ * Claude 22/10/2026 (parere #29 di Astra, §7): corsa deterministica fra le
+ * due passate di B1. Con hw.vmm.vmx.vept_test_race L0, durante un INVEPT,
+ * inverte il bit W di una voce EPT12 di livello 0 con una foglia shadow viva,
+ * come farebbe un altro LP dell'L1 (1 = una volta, 2 = a ogni tentativo).
+ * Dopo ogni INVEPT l'esito di una scrittura dell'L2 su una pagina deve
+ * corrispondere al bit W ATTUALE della sua voce: scrittura riuscita su una
+ * voce senza W = foglia shadow vecchia conservata (errore di B1); EPT
+ * violation su una voce con W = errore opposto. Le iniezioni avvengono solo
+ * dentro un INVEPT, quindi la voce letta dall'L1 dopo l'ultimo INVEPT e'
+ * quella vera. Una EPT violation (anche su pagine non del test) rimette W
+ * e la scrittura riprende.
+ */
+#define	B1R_N		512
+#define	B1R_ITER	50
+static int b1r_foreign, b1r_badforeign;
+
+/* L2 esegue b1_op fino alla VMCALL; ritorna true se c'e' stata una EPT
+ * violation su gpa_watch. Le violation rimettono W nella voce colpita. */
+static bool b1r_run(u64 gpa_watch)
+{
+	unsigned long pte;
+	bool hit = false;
+	u64 gpa;
+
+	enter_guest();
+	while ((vmcs_read(EXI_REASON) & 0xffff) == VMX_EPT_VIOLATION) {
+		gpa = vmcs_read(INFO_PHYS_ADDR) & ~0xfffull;
+		if (gpa == gpa_watch)
+			hit = true;
+		else
+			b1r_foreign++;
+		if (!get_ept_pte(pml4, gpa, 1, &pte) || (pte & EPT_WA)) {
+			b1r_badforeign++;	/* violation senza voce o con W */
+			if (!get_ept_pte(pml4, gpa, 1, &pte))
+				return hit;
+		}
+		set_ept_pte(pml4, gpa, 1, pte | EPT_WA);
+		invept(INVEPT_SINGLE, eptp);
+		enter_guest();
+	}
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+	return hit;
+}
+
+static void vmx_ept_b1_race_test(void)
+{
+	char *rg_p;
+	unsigned long pte;
+	int k, j, nro = 0, nviol = 0, stale = 0, spurious = 0;
+	bool ro, hit;
+	u64 a;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	rg_p = alloc_pages(10);
+	b1_tag(rg_p, 1024, 9);
+	for (j = 0; j < B1R_N; j++) {
+		install_ept(pml4, (unsigned long)rg_p + j * PAGE_SIZE,
+		    (unsigned long)rg_p + j * PAGE_SIZE, EPT_PRESENT);
+		b1_addr[j] = (u64)rg_p + j * PAGE_SIZE;
+		b1_exp[j] = b1_tagof(9, j);
+	}
+	b1_n = B1R_N;
+	invept(INVEPT_SINGLE, eptp);
+	test_set_guest(b1_guest);
+	b1_do(B1_OP_VERIFY);		/* foglie shadow vive */
+	printf("B1RACE: pronto\n");
+	for (k = 0; k < B1R_ITER; k++) {
+		invept(INVEPT_SINGLE, eptp);	/* qui L0 puo' iniettare */
+		for (j = 0; j < B1R_N; j++) {
+			a = (u64)rg_p + j * PAGE_SIZE;
+			if (!get_ept_pte(pml4, a, 1, &pte))
+				continue;
+			ro = (pte & EPT_WA) == 0;
+			nro += ro;
+			b1_addr[0] = a;
+			b1_wval = b1_tagof(9, j);
+			b1_op = B1_OP_WRITE;
+			hit = b1r_run(a);
+			nviol += hit;
+			if (ro && !hit)
+				stale++;	/* scrittura su voce senza W */
+			if (!ro && hit)
+				spurious++;
+		}
+	}
+	printf("B1RACE: fine, voci senza W viste %d, violation %d, estranee %d\n",
+	    nro, nviol, b1r_foreign);
+	report(stale == 0, "B1 corsa: nessuna foglia vecchia conservata (%d)",
+	    stale);
+	report(spurious == 0 && b1r_badforeign == 0,
+	    "B1 corsa: nessuna EPT violation ingiustificata (%d, %d)",
+	    spurious, b1r_badforeign);
+	report(nro > 0, "B1 corsa: iniezioni viste dall'L1 (%d)", nro);
+	b1_n = B1R_N;
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1 corsa: contenuto delle pagine intatto (%lu)",
+	    b1_mism);
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
+/*
  * Claude 21/10/2026 (parere #28 di Astra, §4): prova d'iniezione della
  * generazione dei mapping di L0. Stampa "B1MG: pronto" e per circa B1MG_CYC
  * cicli di TSC ripete INVEPT senza modifiche + verifica delle 1000 pagine
@@ -13020,6 +13126,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_ept_b1_persist_test),
 	TEST(vmx_ept_b1_conc_test),
 	TEST(vmx_ept_b1_memgen_test),
+	TEST(vmx_ept_b1_race_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
