@@ -10043,6 +10043,234 @@ static void vmx_ept_b1_conc_test(void)
 	enter_guest();
 }
 
+/*
+ * Claude 22/10/2026 (parere #31 di Astra, §4): T2 a quattro LP. LP0 esegue
+ * l'L2 e verifica; LP1..LP3 scrivono ciascuno PTE EPT12 in una SUA tabella
+ * (regioni A, B, C da 256 pagine, ognuna con la sua PT).
+ *  - sincronizzata (decisiva): ogni scrittore cambia una PTE, smp_wmb, segnala;
+ *    LP0 aspetta tutti e tre, smp_rmb, INVEPT, l'L2 verifica le 768 pagine;
+ *  - non sincronizzata: ognuno alterna di continuo 8 PTE della sua tabella;
+ *    l'L2 non deve mai vedere valori estranei ne' pagine non toccate sbagliate;
+ *  - tabella condivisa: due PDE (G1, G2) puntano alla STESSA PT (regione D);
+ *    LP3 cambia una sua voce; dopo l'INVEPT l'L2 deve vedere il cambio da
+ *    ENTRAMBI gli alias (B1 deve passare dal percorso dell'aliasing).
+ */
+#define	B4_N		256
+#define	B4_ROUNDS	1000
+static volatile u64 *b4_pte[4][B4_N];
+static u64 b4_P[4][B4_N], b4_Q[4][B4_N];
+static volatile int b4_mode, b4_stop, b4_req, b4_done[4], b4_stopped[4];
+
+static void b4_toggle(int reg, int j)
+{
+	*b4_pte[reg][j] = (*b4_pte[reg][j] == b4_P[reg][j]) ? b4_Q[reg][j] :
+	    b4_P[reg][j];
+}
+
+static void b4_writer(void *data)
+{
+	int w = (int)(long)data, r, k = 0;
+
+	while (!b4_stop) {
+		r = b4_req;
+		if (b4_mode == 1 && r != b4_done[w]) {
+			b4_toggle(w, (r * 7 + w * 131) % B4_N);
+			smp_wmb();
+			b4_done[w] = r;
+		} else if (b4_mode == 2) {
+			b4_toggle(w, (k++ % 8) * 31);
+		} else if (b4_mode == 3 && r != b4_done[w]) {
+			if (w == 3)
+				b4_toggle(0, r % B4_N);	/* la PT condivisa */
+			smp_wmb();
+			b4_done[w] = r;
+		}
+		pause();
+	}
+	b4_stopped[w] = 1;
+}
+
+static u64 b4_tag(int reg, int j, bool q)
+{
+	return (b1_tagof((q ? 30 : 20) + reg, j));
+}
+
+static void b4_setup_region(int reg, char *p, char *q)
+{
+	int j;
+
+	b1_tag(p, B4_N, 20 + reg); b1_tag(q, B4_N, 30 + reg);
+	for (j = 0; j < B4_N; j++) {
+		install_ept(pml4, (unsigned long)p + j * PAGE_SIZE,
+		    (unsigned long)p + j * PAGE_SIZE, EPT_PRESENT);
+		b4_pte[reg][j] = b1_pte_ptr(pml4, (unsigned long)p + j * PAGE_SIZE);
+		b4_P[reg][j] = *b4_pte[reg][j];
+		b4_Q[reg][j] = (b4_P[reg][j] & ~EPT_ADDR_MASK) |
+		    (((unsigned long)q + j * PAGE_SIZE) & EPT_ADDR_MASK);
+	}
+}
+
+/* attese dell'L2 per le regioni 1..3 (768 pagine) */
+static void b4_expect_abc(char **rp)
+{
+	int reg, j, i = 0;
+
+	for (reg = 1; reg <= 3; reg++)
+		for (j = 0; j < B4_N; j++, i++) {
+			b1_addr[i] = (u64)rp[reg] + j * PAGE_SIZE;
+			b1_exp[i] = b4_tag(reg, j, *b4_pte[reg][j] == b4_Q[reg][j]);
+		}
+	b1_n = i;
+}
+
+/* attese per la regione D vista da G1 e da G2 (512 pagine) */
+static void b4_expect_alias(char *g1, char *g2)
+{
+	int j;
+
+	for (j = 0; j < B4_N; j++) {
+		u64 t = b4_tag(0, j, *b4_pte[0][j] == b4_Q[0][j]);
+
+		b1_addr[j] = (u64)g1 + j * PAGE_SIZE;
+		b1_exp[j] = t;
+		b1_addr[B4_N + j] = (u64)g2 + j * PAGE_SIZE;
+		b1_exp[B4_N + j] = t;
+	}
+	b1_n = 2 * B4_N;
+}
+
+static void b4_round(int mode, int r)
+{
+	int w;
+
+	b4_req = r;
+	for (w = 1; w <= 3; w++)
+		while (b4_done[w] != r)
+			pause();
+	smp_rmb();
+}
+
+static void vmx_ept_b1_conc4_test(void)
+{
+	char *rp[4], *rq[4], *g2;
+	unsigned long pde;
+	int reg, r, j, w, bad_sync = 0, bad_alias = 0, odd = 0, bad_unsync = 0;
+	int seenq = 0, seenp = 0;
+
+	if (cpu_count() < 4) {
+		report_skip("%s : servono 4 processori", __func__);
+		return;
+	}
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s : EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	for (reg = 0; reg < 4; reg++) {
+		rp[reg] = alloc_pages(9);	/* 2 MiB allineati: una PT a testa */
+		rq[reg] = alloc_pages(9);
+		b4_setup_region(reg, rp[reg], rq[reg]);
+	}
+	/* G2: un altro intervallo da 2 MiB la cui PDE punta alla PT di D */
+	g2 = alloc_pages(9);
+	assert(get_ept_pte(pml4, (unsigned long)rp[0], 2, &pde));
+	set_ept_pte(pml4, (unsigned long)g2, 2, pde);
+	invept(INVEPT_SINGLE, eptp);
+	test_set_guest(b1_guest);
+	b4_expect_abc(rp);
+	b1_do(B1_OP_VERIFY);
+	b4_expect_alias(rp[0], g2);
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1 T2/4: alias della PT condivisa coerenti all'inizio (%lu)",
+	    b1_mism);
+
+	b4_stop = 0; b4_req = 0; b4_mode = 1;
+	for (w = 1; w <= 3; w++) {
+		b4_done[w] = 0; b4_stopped[w] = 0;
+		on_cpu_async(w, b4_writer, (void *)(long)w);
+	}
+
+	/* sincronizzata: tre scrittori, poi INVEPT e verifica */
+	for (r = 1; r <= B4_ROUNDS; r++) {
+		b4_round(1, r);
+		b4_expect_abc(rp);
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_VERIFY);
+		if (b1_mism != 0) {
+			if (bad_sync < 5)
+				printf("sincronizzata, giro %d: %lu discordanze\n",
+				    r, b1_mism);
+			bad_sync++;
+		}
+	}
+	report(bad_sync == 0,
+	    "B1 T2/4: modifiche di 3 LP ordinate prima dell'INVEPT: %d giri, discordanze %d",
+	    B4_ROUNDS, bad_sync);
+
+	/* tabella condivisa: LP3 cambia una voce della PT di D */
+	b4_mode = 3;
+	for (r = B4_ROUNDS + 1; r <= B4_ROUNDS + 500; r++) {
+		b4_round(3, r);
+		b4_expect_alias(rp[0], g2);
+		invept(INVEPT_SINGLE, eptp);
+		b1_do(B1_OP_VERIFY);
+		if (b1_mism != 0) {
+			if (bad_alias < 5)
+				printf("tabella condivisa, giro %d: %lu discordanze\n",
+				    r, b1_mism);
+			bad_alias++;
+		}
+	}
+	report(bad_alias == 0,
+	    "B1 T2/4: PT condivisa da due PDE, entrambi gli alias aggiornati: 500 giri, discordanze %d",
+	    bad_alias);
+
+	/* non sincronizzata: tre scrittori alternano 8 PTE ciascuno */
+	b4_expect_abc(rp);	/* stato prima delle alternanze */
+	b4_mode = 2;
+	for (r = 0; r < B4_ROUNDS; r++) {
+		invept(INVEPT_SINGLE, eptp);
+		b1_n = 3 * B4_N;
+		b1_do(B1_OP_READ);
+		for (reg = 1, j = 0; j < 3 * B4_N; j++) {
+			int jj = j % B4_N;
+			bool altern = (jj % 31) == 0 && jj / 31 < 8;
+
+			reg = 1 + j / B4_N;
+			if (altern) {
+				if (b1_val[j] == b4_tag(reg, jj, true))
+					seenq++;
+				else if (b1_val[j] == b4_tag(reg, jj, false))
+					seenp++;
+				else
+					odd++;
+			} else if (b1_val[j] != b1_exp[j])
+				bad_unsync++;
+		}
+	}
+	b4_stop = 1;
+	for (w = 1; w <= 3; w++)
+		while (!b4_stopped[w])
+			pause();
+	report(odd == 0 && bad_unsync == 0,
+	    "B1 T2/4: 3 scrittori non sincronizzati: valori estranei %d, pagine non toccate sbagliate %d",
+	    odd, bad_unsync);
+	report(seenq > 0 && seenp > 0,
+	    "B1 T2/4: l'L2 ha visto entrambe le versioni delle PTE alternate (%d/%d)",
+	    seenp, seenq);
+
+	/* a scritture ferme: tutto coerente con l'EPT12 finale */
+	b4_expect_abc(rp);
+	invept(INVEPT_SINGLE, eptp);
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1 T2/4: dopo l'ultimo INVEPT tutto coerente (%lu)",
+	    b1_mism);
+	b4_expect_alias(rp[0], g2);
+	b1_do(B1_OP_VERIFY);
+	report(b1_mism == 0, "B1 T2/4: alias coerenti alla fine (%lu)", b1_mism);
+	b1_op = B1_OP_EXIT;
+	enter_guest();
+}
+
 static void vmx_pending_event_test(void)
 {
 	vmx_pending_event_test_core(false);
@@ -13128,6 +13356,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_ept_b1_conc_test),
 	TEST(vmx_ept_b1_memgen_test),
 	TEST(vmx_ept_b1_race_test),
+	TEST(vmx_ept_b1_conc4_test),
 	TEST(vmx_pending_event_hlt_test),
 	TEST(vmx_store_tsc_test),
 	TEST(vmx_preemption_timer_zero_test),
