@@ -12531,6 +12531,142 @@ static void vmx_pf_vpid_test(void)
 	__vmx_pf_vpid_test(invalidate_tlb_new_vpid, 1);
 }
 
+
+/*
+ * Claude 25/10/2026 -- bhyve nested, pareri #48/#49 di Astra: il contesto TLB
+ * dell'L2 deve cambiare quando cambia l'identita' del contesto VPID virtuale.
+ * L'L2 (senza EPT nel VMCS12, stesso CR3 dell'L1) legge un indirizzo lineare
+ * di prova; l'L1 cambia la pagina fisica dietro quell'indirizzo SENZA
+ * invalidare il contesto dell'L2, poi rientra con un contesto che
+ * architetturalmente non puo' avere traduzioni di quell'indirizzo: un VPID12
+ * mai usato, oppure VPID disabilitato (ingresso = flush del contesto VPID 0).
+ * Ogni passo controlla il VALORE letto dall'L2, non solo che termini.
+ * vmx_vpid_ctx_test aggiunge un ciclo VMXOFF/VMXON fra due passi.
+ */
+static volatile u64 *vpidtr_probe;
+static volatile u64 vpidtr_seen;
+
+static void vpidtr_guest(void)
+{
+	for (;;) {
+		vpidtr_seen = *vpidtr_probe;
+		vmcall();
+	}
+}
+
+static u64 *vpidtr_va;
+static u64 *vpidtr_pg[2];
+
+static void vpidtr_map(int which)
+{
+	pteval_t *pte = get_pte(phys_to_virt(read_cr3()), vpidtr_va);
+
+	*pte = (virt_to_phys(vpidtr_pg[which]) & PT_ADDR_MASK) |
+	    PT_PRESENT_MASK | PT_WRITABLE_MASK;
+	invlpg(vpidtr_va);		/* solo il contesto dell'L1 */
+	TEST_ASSERT(*vpidtr_va == *vpidtr_pg[which]);
+}
+
+static void vpidtr_ctx(int vpid)
+{
+	if (vpid) {
+		vmcs_set_bits(CPU_EXEC_CTRL1, CPU_VPID);
+		vmcs_write(VPID, vpid);
+	} else
+		vmcs_clear_bits(CPU_EXEC_CTRL1, CPU_VPID);
+}
+
+static void vpidtr_step(int vpid, int which, const char *what)
+{
+	vpidtr_ctx(vpid);
+	vpidtr_seen = 0;
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_insn();
+	report(vpidtr_seen == *vpidtr_pg[which],
+	    "%s: VPID12 %d, letto %#lx, atteso %#lx", what, vpid,
+	    (unsigned long)vpidtr_seen, (unsigned long)*vpidtr_pg[which]);
+}
+
+static bool vpidtr_setup(void)
+{
+	if (!is_vpid_supported()) {
+		report_skip("VPID non supportato");
+		return false;
+	}
+	vpidtr_pg[0] = alloc_page();
+	vpidtr_pg[1] = alloc_page();
+	vpidtr_pg[0][0] = 0x1111111111111111ull ^ rdtsc();
+	vpidtr_pg[1][0] = 0x2222222222222222ull ^ rdtsc();
+	vpidtr_va = alloc_vpage();
+	install_page(phys_to_virt(read_cr3()), virt_to_phys(vpidtr_pg[0]),
+	    vpidtr_va);
+	vpidtr_probe = vpidtr_va;
+	vmcs_set_bits(CPU_EXEC_CTRL0, CPU_SECONDARY);
+	test_set_guest(vpidtr_guest);
+	return true;
+}
+
+static void vmx_vpid_ctx_test(void)
+{
+	struct vmcs *vmcs;
+	int i, round;
+
+	if (!vpidtr_setup())
+		return;
+	for (round = 0; round < 64; round++) {
+		int base = 1 + round * 8;	/* VPID12 mai usati in questo giro */
+
+		vpidtr_map(0);
+		vpidtr_step(base, 0, "VPID12 nuovo");
+		vpidtr_map(1);
+		vpidtr_step(base + 1, 1, "VPID12 cambiato");
+		vpidtr_map(0);
+		vpidtr_step(0, 0, "VPID disabilitato");
+		vpidtr_map(1);
+		vpidtr_step(base + 2, 1, "riabilitato con VPID12 nuovo");
+		/* A -> disabilitato -> A: il tratto senza VPID non deve
+		 * lasciare traduzioni al contesto A */
+		vpidtr_map(0);
+		vpidtr_step(0, 0, "disabilitato (prima di A)");
+		vpidtr_map(1);
+		for (i = 0; i < 2; i++)
+			vpidtr_step(i == 0 ? base + 3 : base + 3, 1,
+			    "A dopo il tratto senza VPID");
+		/* ciclo VMXOFF/VMXON, poi un VPID12 nuovo e poi disabilitato */
+		vpidtr_step(base + 4, 1, "prima di VMXOFF");
+		TEST_ASSERT(!vmcs_save(&vmcs));
+		TEST_ASSERT(!vmcs_clear(vmcs));
+		TEST_ASSERT(!vmx_off());
+		vpidtr_map(0);
+		TEST_ASSERT(!vmx_on());
+		TEST_ASSERT(!make_vmcs_current(vmcs));
+		vpidtr_step(base + 5, 0, "dopo VMXON, VPID12 nuovo");
+		vpidtr_map(1);
+		vpidtr_step(0, 1, "dopo VMXON, VPID disabilitato");
+	}
+	vpidtr_ctx(0);
+	test_set_guest_finished();
+}
+
+/*
+ * Riuso del VPID02 fra VM (parere #49 §6): ogni VM scrive un valore diverso
+ * (dal TSC) nella pagina di prova e l'L2, con VPID12 = 1, deve leggere quello
+ * della SUA VM. Si esegue piu' volte di seguito sulla stessa CPU fisica: una
+ * traduzione rimasta da una VM precedente porterebbe a un'altra pagina.
+ */
+static void vmx_vpid_crossvm_test(void)
+{
+	int i;
+
+	if (!vpidtr_setup())
+		return;
+	for (i = 0; i < 16; i++)
+		vpidtr_step(1, 0, "VM nuova, VPID12 1");
+	vpidtr_ctx(0);
+	test_set_guest_finished();
+}
+
 static void vmx_l2_ac_test(void)
 {
 	bool hit_ac = false;
@@ -13402,6 +13538,8 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_pf_no_vpid_test),
 	TEST(vmx_pf_invvpid_test),
 	TEST(vmx_pf_vpid_test),
+	TEST(vmx_vpid_ctx_test),
+	TEST(vmx_vpid_crossvm_test),
 	TEST(vmx_exception_test),
 	TEST(vmx_canonical_test),
 	/* "Load CET" VM-entry/exit controls tests. */
