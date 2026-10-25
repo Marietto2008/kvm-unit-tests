@@ -12557,6 +12557,14 @@ static void vpidtr_guest(void)
 static u64 *vpidtr_va;
 static u64 *vpidtr_pg[2];
 
+/*
+ * Cambia la pagina fisica dietro vpidtr_va. L'INVLPG dell'L1 invalida SOLO il
+ * contesto corrente, cioe' quello dell'L1 (per l'architettura il VPID 0
+ * dell'L1, per L0 il VPID01): le traduzioni dell'L2, nel suo contesto VPID,
+ * restano intatte e il test non diventa banale. Il TEST_ASSERT dimostra che
+ * prima di rientrare in L2 l'L1 vede gia' la PTE nuova; quindi un valore
+ * vecchio letto dall'L2 puo' venire solo dal contesto TLB dell'L2.
+ */
 static void vpidtr_map(int which)
 {
 	pteval_t *pte = get_pte(phys_to_virt(read_cr3()), vpidtr_va);
