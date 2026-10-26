@@ -12686,6 +12686,46 @@ static void vmx_vpid_crossvm_test(void)
  */
 static volatile u32 e12_seen;
 static unsigned long e12_gpa;
+static int e12_invept_global;	/* 0 = INVEPT SINGLE, 1 = INVEPT GLOBAL */
+static int e12_cold;		/* 1 = non toccare la sonda a stage0 (nessuna voce TLB) */
+
+/* Parere #58 §5: ricostruisce GVA->GPA camminando le tabelle di pagina di L2
+ * (CR3 letta dal VMCS02). Stesso schema di clear_ept_ad (x86/vmx.c:1079):
+ * con identity in L1 la GPA di ogni tabella e' dereferenziabile. Ritorna la
+ * GPA effettiva e, via *leaf_out, la PTE foglia. ~0UL se non presente. */
+static unsigned long e12_gva_to_gpa(u64 cr3, unsigned long gva,
+    unsigned long *leaf_out)
+{
+	unsigned long *pt = (unsigned long *)(cr3 & PT_ADDR_MASK);
+	u64 pte = 0;
+	unsigned offset;
+	int l;
+
+	for (l = EPT_PAGE_LEVEL; ; --l) {
+		offset = (gva >> EPT_LEVEL_SHIFT(l)) & EPT_PGDIR_MASK;
+		pte = pt[offset];
+		if (!(pte & PT_PRESENT_MASK)) {
+			if (leaf_out)
+				*leaf_out = pte;
+			return (~0UL);
+		}
+		if (l == 1 || (l < 4 && (pte & PT_PAGE_SIZE_MASK)))
+			break;
+		pt = (unsigned long *)(pte & PT_ADDR_MASK);
+	}
+	if (leaf_out)
+		*leaf_out = pte;
+	return ((pte & PT_ADDR_MASK) | (gva & ((1UL << EPT_LEVEL_SHIFT(l)) - 1)));
+}
+
+/* discriminante: SINGLE aggancia lo slot per eptp12; GLOBAL invalida tutto */
+static inline void e12_invept(void)
+{
+	if (e12_invept_global)
+		invept(INVEPT_GLOBAL, 0);
+	else
+		invept(INVEPT_SINGLE, eptp);
+}
 
 static int ept12_remap_init(struct vmcs *vmcs)
 {
@@ -12693,6 +12733,7 @@ static int ept12_remap_init(struct vmcs *vmcs)
 
 	if (r != VMX_TEST_START)
 		return r;
+	e12_invept_global = 0;
 	/*
 	 * ept_init_common ha gia' fatto install_ept(data_page1_hpa,
 	 * data_page2_gpa): la GPA di data_page2 risolve alla pagina fisica di
@@ -12703,14 +12744,187 @@ static int ept12_remap_init(struct vmcs *vmcs)
 	return VMX_TEST_START;
 }
 
+/* identico a ept12_remap ma invalida con INVEPT GLOBAL invece che SINGLE */
+static int ept12_remap_g_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_invept_global = 1;
+	return r;
+}
+
+static int e12_split4k;		/* 1 = spezza a 4K la pagina guest della sonda */
+static int e12_invlpg;		/* 1 = INVLPG della GVA sonda prima della rilettura (parere #59 §5) */
+
+/* parere #59 §8-03: INVLPG esplicito in L2 della GVA sonda prima dello stage1.
+ * Separa la cache delle traduzioni lineari del guest dal comportamento EPT. */
+static int ept12_remap_invlpg_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_invlpg = 1;
+	return r;
+}
+
+/* parere #60 §4: test negativi. gpf = PTE guest della sonda non-present (deve
+ * dare #PF in L2); ept12np = EPT12 della sonda non-present (deve dare EPT
+ * violation). Controlli positivi che la mov esegua davvero il percorso atteso. */
+static int e12_gpf;
+static int e12_ept12np;
+static volatile int e12_pf_seen;
+static volatile unsigned long e12_cr2;
+/* parere #61: sentinella (verifica 3) e nuova GVA (verifica 4) */
+static int e12_sentinel;
+static int e12_newgva;
+static volatile u32 e12_s1_val;		/* valore letto a stage1 (indipendente da e12_seen) */
+static volatile u32 e12_s1_done;	/* marcatore di completamento stage1 */
+static unsigned long e12_gva2;		/* nuova GVA mai letta, -> stessa GPA */
+
+static void e12_touch(void *data)
+{
+	e12_seen = *(volatile u32 *)data;	/* la STESSA lettura della sonda */
+}
+
+static int ept12_remap_gpf_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_gpf = 1;
+	return r;
+}
+
+static int ept12_remap_np_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_ept12np = 1;
+	return r;
+}
+
+/* parere #61 §3: cella sentinella indipendente, per dimostrare che il valore
+ * stantio nasce da una NUOVA mov a stage1 e non e' riciclato dallo stage0. */
+/* parere #62/#66: MOV -> RAX -> VMCALL. L2 lascia il valore letto in RAX; il
+ * gestore lo legge dal GPR salvato (this_cpu_guest_regs()->rax), canale
+ * INDIPENDENTE dalla pagina condivisa del test. */
+static int e12_rax;
+static int ept12_remap_rax_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_rax = 1;
+	return r;
+}
+
+static int ept12_remap_sentinel_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_sentinel = 1;
+	return r;
+}
+
+/* parere #61 §5: nuova GVA mai letta, mappata (4K guest) sulla stessa GPA. */
+static int ept12_remap_newgva_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_newgva = 1;
+	return r;
+}
+
+/* come np ma con INVLPG della sonda prima della rilettura: svuota la traduzione
+ * combinata stantia, cosi' il walk raggiunge lo stadio EPT (EPT12 non-present).
+ * Se compare la EPT violation -> l'INVEPT non svuotava il combinato; se resta
+ * stantio -> nemmeno INVLPG forza lo stadio EPT. */
+static int ept12_remap_npinvlpg_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_np_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_invlpg = 1;
+	return r;
+}
+
+/* identico a ept12_remap ma la sonda e' mappata a 4K nel paging di L2 (spezza
+ * la large page 2 MB che la copriva): isola l'interazione guest-2MB / EPT-4K.
+ * Lo split avviene nel gestore di stage0 sulla GUEST_CR3 reale del VMCS02. */
+static int ept12_remap_4k_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_split4k = 1;
+	return r;
+}
+
+/* identico a ept12_remap ma la sonda e' toccata per la prima volta a stage1:
+ * se passa, il valore stantio di ept12_remap veniva da una voce TLB di stage0
+ * sopravvissuta all'invalidazione (bug del modulo), non dal test. */
+static int ept12_remap_cold_init(struct vmcs *vmcs)
+{
+	int r = ept12_remap_init(vmcs);
+
+	if (r == VMX_TEST_START)
+		e12_cold = 1;
+	return r;
+}
+
 static void ept12_remap_main(void)
 {
-	e12_seen = *(volatile u32 *)e12_gpa;	/* stage 0: attesa MAGIC_VAL_1 (pagina di data_page1) */
+	/* stage 0: a freddo NON si tocca la sonda, cosi' a stage1 e' il primo
+	 * accesso in assoluto (niente voce TLB precedente al remap). */
+	if (!e12_cold)
+		e12_seen = *(volatile u32 *)e12_gpa;	/* stage 0: attesa MAGIC_VAL_1 */
 	vmcall();
-	e12_seen = *(volatile u32 *)e12_gpa;	/* stage 1: DEVE essere MAGIC_VAL_2 (pagina di data_page2) */
+	/* parere #60 §4.1: il gestore ha reso non-present la PTE guest della
+	 * sonda; la STESSA mov deve dare #PF (CR2 = GVA). Positivo del percorso
+	 * lineare: se non arriva il #PF, non stiamo osservando quell'accesso. */
+	if (e12_gpf) {
+		unsigned ec, vec;
+		invlpg((void *)e12_gpa);
+		e12_pf_seen = test_for_exception(PF_VECTOR, e12_touch,
+		    (void *)e12_gpa);
+		e12_cr2 = read_cr2();
+		vec = exception_vector();
+		ec = exception_error_code();
+		report(e12_pf_seen && e12_cr2 == e12_gpa,
+		    "guest-#PF: PTE guest non-present -> #PF a L2, CR2=%#lx (atteso %#lx) vettore=%d errcode=%#x",
+		    e12_cr2, (unsigned long)e12_gpa, vec, ec);
+		vmcall();
+		return;
+	}
+	/* parere #62/#66: la mov e il vmcall in UN solo blocco asm, cosi' RAX
+	 * contiene il valore letto al VM-exit; il gestore lo legge dal GPR salvato.
+	 * Canale indipendente dalla pagina condivisa del test. */
+	if (e12_rax) {
+		asm volatile("movl (%0), %%eax\n\t vmcall"
+		    :: "r"(e12_gpa) : "eax", "memory");
+		return;
+	}
+	/* parere #59 §5: invalida la traduzione lineare della sonda prima della
+	 * rilettura, per separare la cache GVA->* dal walk EPT. */
+	if (e12_invlpg)
+		asm volatile("invlpg (%0)" :: "r"(e12_gpa) : "memory");
+	/* stage 1: newgva legge una GVA fresca che punta alla STESSA GPA; gli altri
+	 * leggono e12_gpa. Si usa la forma `e12_seen = *(volatile)` del test
+	 * principale, che propaga davvero il valore a L1 (il canale report()/global
+	 * asm da L2 e' inaffidabile in questo harness nested). Per sentinella/newgva
+	 * e12_seen e' stata preimpostata a 0xdeadbeef nel gestore: se resta tale, la
+	 * mov non ha eseguito; MAGIC_1 = stantio; MAGIC_2 = pagina nuova. */
+	e12_seen = *(volatile u32 *)(e12_newgva ? e12_gva2 : e12_gpa);
 	vmcall();
-	*(volatile u32 *)e12_gpa = MAGIC_VAL_3;	/* stage 2: scrittura -> EPT violation attesa */
-	vmcall();				/* raggiunto solo dopo il ripristino del permesso */
+	/* stage 2 (revoca permesso) eseguito solo se il remap e' corretto */
+	if (vmx_get_test_stage() == 2) {
+		*(volatile u32 *)e12_gpa = MAGIC_VAL_3;
+		vmcall();
+	}
 }
 
 static int ept12_remap_exit(union exit_reason exit_reason)
@@ -12720,24 +12934,166 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 	switch (exit_reason.basic) {
 	case VMX_VMCALL:
 		switch (vmx_get_test_stage()) {
-		case 0:
-			report(e12_seen == MAGIC_VAL_1,
-			    "EPT12: L2 legge la pagina iniziale (data_page1)");
+		case 0: {
+			unsigned long pte_before = 0, pte_after = 0;
+			get_ept_pte(pml4, e12_gpa, 1, &pte_before);
+			printf("E12DIAG stage0 l2_gpa=%#lx eptp12=%#lx "
+			    "ept12_leaf=%#lx value_actual=%#x value_expected=%#x\n",
+			    e12_gpa, (unsigned long)eptp, pte_before,
+			    e12_seen, (u32)MAGIC_VAL_1);
+			if (!e12_cold)
+				report(e12_seen == MAGIC_VAL_1,
+				    "EPT12: L2 legge la pagina iniziale (data_page1)");
+			else
+				report_pass("EPT12 (freddo): sonda non toccata a stage0");
+			/* 4k: spezza la large page 2 MB del guest sulla CR3 reale
+			 * di L2, cosi' la sonda usa una PTE guest a 4K. */
+			if (e12_split4k) {
+				u64 gcr3 = vmcs_read(GUEST_CR3);
+				pteval_t *pde = get_pte_level(
+				    (pgd_t *)(gcr3 & PT_ADDR_MASK),
+				    (void *)e12_gpa, 2);
+				if (pde && (*pde & PT_PAGE_SIZE_MASK))
+					split_large_page((unsigned long *)pde, 2);
+			}
+			if (e12_gpf) {
+				/* parere #60 §4.1: rende non-present la PTE guest
+				 * della sonda (spezzando la 2 MB), sulla CR3 reale di
+				 * L2. Nessun remap EPT. */
+				u64 gcr3 = vmcs_read(GUEST_CR3);
+				pteval_t *pde = get_pte_level(
+				    (pgd_t *)(gcr3 & PT_ADDR_MASK), (void *)e12_gpa, 2);
+				pteval_t *pte;
+				if (pde && (*pde & PT_PAGE_SIZE_MASK))
+					split_large_page((unsigned long *)pde, 2);
+				pte = get_pte((pgd_t *)(gcr3 & PT_ADDR_MASK),
+				    (void *)e12_gpa);
+				if (pte)
+					*pte &= ~PT_PRESENT_MASK;
+				e12_invept();
+				vmx_inc_test_stage();
+				break;
+			}
+			if (e12_ept12np) {
+				/* parere #60 §4.2: EPT12 della sonda non-present
+				 * (R/W/X=0) + INVEPT. La rilettura deve dare EPT viol. */
+				install_ept(pml4, (unsigned long)data_page2,
+				    (unsigned long)data_page2, 0);
+				get_ept_pte(pml4, e12_gpa, 1, &pte_after);
+				e12_invept();
+				printf("E12DIAG ept12np leaf_after=%#lx (atteso non-present)\n",
+				    pte_after);
+				vmx_inc_test_stage();
+				break;
+			}
 			/* rimappa GPA(data_page2) sulla propria pagina fisica + INVEPT */
 			install_ept(pml4, (unsigned long)data_page2,
 			    (unsigned long)data_page2, EPT_RA | EPT_WA | EPT_EA);
-			invept(INVEPT_SINGLE, eptp);
+			get_ept_pte(pml4, e12_gpa, 1, &pte_after);
+			e12_invept();
+			printf("E12DIAG remap leaf_before=%#lx leaf_after=%#lx "
+			    "target_before=%#lx target_after=%#lx invept=%s eptp=%#lx\n",
+			    pte_before, pte_after,
+			    (unsigned long)data_page1, (unsigned long)data_page2,
+			    e12_invept_global ? "GLOBAL" : "SINGLE",
+			    (unsigned long)eptp);
+			/* parere #61 §3: azzera il canale del valore con una sentinella,
+			 * cosi' a stage1 si dimostra che la mov ha davvero prodotto il
+			 * valore letto (e non e' quello riciclato dallo stage0). */
+			if (e12_sentinel || e12_newgva) {
+				e12_seen = 0xdeadbeef;
+				e12_s1_val = 0xdeadbeef;
+				e12_s1_done = 0;
+			}
+			/* parere #61 §5: installa una NUOVA GVA (4K guest) mai letta,
+			 * che traduce alla STESSA GPA della sonda, sulla CR3 di L2. */
+			if (e12_newgva) {
+				u64 gcr3 = vmcs_read(GUEST_CR3);
+				pgd_t *cr3p = (pgd_t *)(gcr3 & PT_ADDR_MASK);
+				pteval_t *pde, *pte;
+				e12_gva2 = e12_gpa + 0x4000000UL;	/* VA alta inutilizzata */
+				/* spezza la 2 MB identity che copre gva2, poi punta la
+				 * PTE 4K di gva2 alla GPA della sonda */
+				pde = get_pte_level(cr3p, (void *)e12_gva2, 2);
+				if (pde && (*pde & PT_PAGE_SIZE_MASK))
+					split_large_page((unsigned long *)pde, 2);
+				pte = get_pte(cr3p, (void *)e12_gva2);
+				if (pte)
+					*pte = (e12_gpa & PT_ADDR_MASK) |
+					    PT_PRESENT_MASK | PT_WRITABLE_MASK;
+				printf("E12DIAG newgva gva2=%#lx -> gpa=%#lx pte=%#lx\n",
+				    e12_gva2, e12_gpa, pte ? *pte : 0);
+			}
 			vmx_inc_test_stage();
 			break;
-		case 1:
-			report(e12_seen == MAGIC_VAL_2,
-			    "EPT12 remap: L2 legge la pagina NUOVA, non la stantia");
+		}
+		case 1: {
+			unsigned long pte_now = 0, l2_leaf = 0;
+			u64 cr3 = vmcs_read(GUEST_CR3);
+			unsigned long gpa_walk;
+			if (e12_gpf) {
+				/* il #PF e il suo CR2 sono gia' stati verificati in L2;
+				 * qui si chiude soltanto. */
+				report_pass("guest-#PF: percorso lineare della sonda confermato");
+				return VMX_TEST_VMEXIT;
+			}
+			if (e12_rax) {
+				/* parere #62/#66: valore letto da L2, preso dal GPR
+				 * salvato (NON dalla pagina condivisa del test). */
+				u32 rax = (u32)this_cpu_guest_regs()->rax;
+				unsigned long pte_now = 0;
+				get_ept_pte(pml4, e12_gpa, 1, &pte_now);
+				printf("E12DIAG RAX: eax=%#x (MAGIC_1=%#x stantio, MAGIC_2=%#x nuovo) ept12_leaf=%#lx\n",
+				    rax, (u32)MAGIC_VAL_1, (u32)MAGIC_VAL_2, pte_now);
+				if (rax == MAGIC_VAL_2)
+					report_pass("MOV->RAX->VMCALL: L2 legge la pagina NUOVA (data_page2) via GPR salvato");
+				else if (rax == MAGIC_VAL_1)
+					report_fail("MOV->RAX->VMCALL: L2 legge STANTIO (data_page1) via GPR salvato, senza EPT violation");
+				else
+					report_fail("MOV->RAX->VMCALL: valore inatteso %#x", rax);
+				return VMX_TEST_VMEXIT;
+			}
+			if (e12_sentinel || e12_newgva) {
+				const char *tag = e12_newgva ?
+				    "newgva (GVA fresca -> stessa GPA)" : "sentinella";
+				unsigned long leaf2 = 0;
+				if (e12_newgva)
+					e12_gva_to_gpa(cr3, e12_gva2, &leaf2);
+				printf("E12DIAG %s: e12_seen=%#x (0xdeadbeef=non eseguito, "
+				    "MAGIC_1=%#x stantio, MAGIC_2=%#x nuovo) gva2_pte=%#lx\n",
+				    tag, e12_seen, (u32)MAGIC_VAL_1, (u32)MAGIC_VAL_2, leaf2);
+				if (e12_seen == 0xdeadbeef)
+					report_fail("%s: stage1 NON eseguita (sentinella intatta)", tag);
+				else if (e12_seen == MAGIC_VAL_1)
+					report_fail("%s: stage1 ESEGUITA, legge STANTIO senza EPT violation", tag);
+				else if (e12_seen == MAGIC_VAL_2)
+					report_pass("%s: stage1 legge la pagina NUOVA (data_page2)", tag);
+				else
+					report_fail("%s: stage1 valore inatteso %#x", tag, e12_seen);
+				return VMX_TEST_VMEXIT;
+			}
+			gpa_walk = e12_gva_to_gpa(cr3, e12_gpa, &l2_leaf);
+			get_ept_pte(pml4, e12_gpa, 1, &pte_now);
+			/* Parere #58 §5: la catena GVA->GPA effettiva in L2. */
+			printf("E12DIAG chain gva=%#lx guest_cr3=%#lx "
+			    "l2_pte=%#lx GPA_effettiva=%#lx (presunta 0x3fed0000)\n",
+			    e12_gpa, (unsigned long)cr3, l2_leaf, gpa_walk);
+			printf("E12DIAG stage1 l2_gpa=%#lx ept12_leaf=%#lx "
+			    "value_actual=%#x value_expected=%#x\n",
+			    e12_gpa, pte_now, e12_seen, (u32)MAGIC_VAL_2);
+			if (e12_seen != MAGIC_VAL_2) {
+				report_fail("EPT12 remap: lettura stantia "
+				    "(letto %#x, atteso %#x) -- STOP", e12_seen, (u32)MAGIC_VAL_2);
+				return VMX_TEST_VMEXIT;	/* stop al primo mismatch */
+			}
+			report_pass("EPT12 remap: L2 legge la pagina NUOVA, non la stantia");
 			/* revoca il permesso di scrittura + INVEPT */
 			install_ept(pml4, (unsigned long)data_page2,
 			    (unsigned long)data_page2, EPT_RA | EPT_EA);
-			invept(INVEPT_SINGLE, eptp);
+			e12_invept();
 			vmx_inc_test_stage();
 			break;
+		}
 		case 3:
 			report_pass("EPT12: scrittura ripresa dopo il ripristino del permesso");
 			return VMX_TEST_VMEXIT;
@@ -12748,12 +13104,34 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 		}
 		return VMX_TEST_RESUME;
 	case VMX_EPT_VIOLATION:
+		if ((e12_newgva || e12_sentinel || e12_rax) && vmx_get_test_stage() == 1) {
+			u64 gpa = vmcs_read(INFO_PHYS_ADDR);
+			if ((gpa & ~0xfffUL) == (e12_gpa & ~0xfffUL)) {
+				report_pass("%s: la lettura ha fatto EPT violation sulla sonda (gpa=%#lx)",
+				    e12_rax ? "RAX" : (e12_newgva ? "newgva" : "sentinella"),
+				    (unsigned long)gpa);
+				return VMX_TEST_VMEXIT;
+			}
+			/* violazione su altra GPA: ricostruzione, si prosegue */
+			return VMX_TEST_RESUME;
+		}
+		if (e12_ept12np && vmx_get_test_stage() == 1) {
+			/* parere #60 §4.2: EPT12 non-present -> EPT violation
+			 * riflessa a L1. Deve riguardare la GPA della sonda. */
+			u64 gpa = vmcs_read(INFO_PHYS_ADDR);
+			printf("E12DIAG ept12np violation gpa=%#lx qual=%#lx\n",
+			    (unsigned long)gpa, (unsigned long)qual);
+			report((gpa & ~0xfffUL) == (e12_gpa & ~0xfffUL),
+			    "EPT12 non-present: EPT violation sulla sonda (gpa=%#lx)",
+			    (unsigned long)gpa);
+			return VMX_TEST_VMEXIT;
+		}
 		if (vmx_get_test_stage() == 2 && (qual & EPT_VLT_WR)) {
 			report_pass("EPT12 revoca permesso: la scrittura ha fatto EPT violation");
 			/* ripristina il permesso di scrittura e riprendi */
 			install_ept(pml4, (unsigned long)data_page2,
 			    (unsigned long)data_page2, EPT_RA | EPT_WA | EPT_EA);
-			invept(INVEPT_SINGLE, eptp);
+			e12_invept();
 			vmx_inc_test_stage();
 			return VMX_TEST_RESUME;
 		}
@@ -13533,6 +13911,16 @@ struct vmx_test vmx_tests[] = {
 		insn_intercept_exit_handler },
 	{ "EPT A/D disabled", ept_init, ept_main, ept_exit_handler },
 	{ "ept12_remap", ept12_remap_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_g", ept12_remap_g_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_cold", ept12_remap_cold_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_invlpg", ept12_remap_invlpg_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_gpf", ept12_remap_gpf_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_np", ept12_remap_np_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_sentinel", ept12_remap_sentinel_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_newgva", ept12_remap_newgva_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_rax", ept12_remap_rax_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_npinvlpg", ept12_remap_npinvlpg_init, ept12_remap_main, ept12_remap_exit },
+	{ "ept12_remap_4k", ept12_remap_4k_init, ept12_remap_main, ept12_remap_exit },
 	{ "EPT A/D enabled", eptad_init, eptad_main, eptad_exit_handler },
 	{ "PML", pml_init, pml_main, pml_exit_handler },
 	{ "interrupt", interrupt_init, interrupt_main, interrupt_exit_handler },
