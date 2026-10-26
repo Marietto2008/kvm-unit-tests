@@ -12814,6 +12814,10 @@ static int e12_rax;
 /* parere #73 §4: RIP del VMCALL di stage0, per provare che il VMCALL di stage1
  * e' un'istruzione DIVERSA (cioe' che il codice di stage1 e' stato eseguito) */
 static u64 e12_rip0;
+/* parere #74 §4: indirizzo ESATTO della lettura di stage1 di _np (etichetta
+ * globale nell'asm di ept12_remap_main): la violation riflessa a L1 deve
+ * avere questo RIP, non un RIP qualunque */
+extern char e12_np_read[];
 static int ept12_remap_rax_init(struct vmcs *vmcs)
 {
 	int r = ept12_remap_init(vmcs);
@@ -12911,6 +12915,17 @@ static void ept12_remap_main(void)
 		    :: "r"(e12_gpa) : "eax", "memory");
 		return;
 	}
+	/* parere #74 §4: _np, lettura di stage1 con indirizzo noto a L1. Deve
+	 * dare una EPT violation riflessa; se invece riesce, il vmcall dopo
+	 * porta al gestore di stage1, che la dichiara FAIL. */
+	if (e12_ept12np) {
+		asm volatile(".globl e12_np_read\n"
+		    "e12_np_read:\n\t"
+		    "movl (%0), %%eax\n\t"
+		    "vmcall"
+		    :: "r"(e12_gpa) : "eax", "memory");
+		return;
+	}
 	/* parere #59 §5: invalida la traduzione lineare della sonda prima della
 	 * rilettura, per separare la cache GVA->* dal walk EPT. */
 	if (e12_invlpg)
@@ -12990,8 +13005,14 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 				    (unsigned long)data_page2, 0);
 				get_ept_pte(pml4, e12_gpa, 1, &pte_after);
 				e12_invept();
-				printf("E12DIAG ept12np leaf_after=%#lx (atteso non-present)\n",
-				    pte_after);
+				printf("E12DIAG ept12np leaf_after=%#lx (atteso non-present) e12_np_read=%#lx\n",
+				    pte_after, (unsigned long)e12_np_read);
+				/* parere #74 §4.2: EPT12 DEVE essere non-present */
+				if ((pte_after & (EPT_RA | EPT_WA | EPT_EA)) != 0) {
+					report_fail("ept12np: la foglia EPT12 della sonda e' ancora presente (%#lx): STOP",
+					    pte_after);
+					return VMX_TEST_VMEXIT;
+				}
 				vmx_inc_test_stage();
 				break;
 			}
@@ -13044,6 +13065,14 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 				/* il #PF e il suo CR2 sono gia' stati verificati in L2;
 				 * qui si chiude soltanto. */
 				report_pass("guest-#PF: percorso lineare della sonda confermato");
+				return VMX_TEST_VMEXIT;
+			}
+			if (e12_ept12np) {
+				/* parere #74 §4: arrivare al VMCALL di stage1 vuol
+				 * dire che la lettura e' RIUSCITA con EPT12 non-present */
+				report_fail("ept12np: la lettura di stage1 e' riuscita nonostante EPT12 non-present (vmcall rip=%#lx eax=%#x)",
+				    (unsigned long)vmcs_read(GUEST_RIP),
+				    (u32)this_cpu_guest_regs()->rax);
 				return VMX_TEST_VMEXIT;
 			}
 			if (e12_rax) {
@@ -13167,11 +13196,25 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			/* parere #60 §4.2: EPT12 non-present -> EPT violation
 			 * riflessa a L1. Deve riguardare la GPA della sonda. */
 			u64 gpa = vmcs_read(INFO_PHYS_ADDR);
-			printf("E12DIAG ept12np violation gpa=%#lx qual=%#lx\n",
-			    (unsigned long)gpa, (unsigned long)qual);
-			report((gpa & ~0xfffUL) == (e12_gpa & ~0xfffUL),
-			    "EPT12 non-present: EPT violation sulla sonda (gpa=%#lx)",
-			    (unsigned long)gpa);
+			u64 rip = vmcs_read(GUEST_RIP);
+			bool gpa_ok = (gpa & ~0xfffUL) == (e12_gpa & ~0xfffUL);
+			bool rip_ok = rip == (u64)(unsigned long)e12_np_read;
+			/* lettura (bit 0) di una traduzione NON presente: i bit
+			 * 5:3 riportano i permessi dell'EPT12, qui tutti 0 */
+			bool qual_ok = (qual & EPT_VLT_RD) &&
+			    !(qual & (EPT_VLT_WR | EPT_VLT_FETCH)) &&
+			    !(qual & (EPT_VLT_PERM_RD | EPT_VLT_PERM_WR | EPT_VLT_PERM_EX));
+
+			printf("E12DIAG ept12np violation gpa=%#lx rip=%#lx (lettura stage1 %#lx) qual=%#lx gpa_ok=%d rip_ok=%d qual_ok=%d\n",
+			    (unsigned long)gpa, (unsigned long)rip,
+			    (unsigned long)e12_np_read, (unsigned long)qual,
+			    gpa_ok, rip_ok, qual_ok);
+			/* parere #74 §4.4: PASS solo se TUTTE e tre: stessa GPA,
+			 * RIP = la lettura di stage1, qualificazione coerente */
+			report(gpa_ok && rip_ok && qual_ok,
+			    "EPT12 non-present: EPT violation della lettura di stage1 sulla sonda riflessa a L1 (gpa=%#lx rip=%#lx qual=%#lx)",
+			    (unsigned long)gpa, (unsigned long)rip,
+			    (unsigned long)qual);
 			return VMX_TEST_VMEXIT;
 		}
 		if (vmx_get_test_stage() == 2 && (qual & EPT_VLT_WR)) {
