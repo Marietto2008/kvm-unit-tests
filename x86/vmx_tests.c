@@ -23,6 +23,7 @@
 #include "delay.h"
 #include "access.h"
 #include "x86/usermode.h"
+#include "e12_oracle.h"
 
 /*
  * vmcs.GUEST_PENDING_DEBUG has the same format as DR6, although some bits that
@@ -12818,6 +12819,10 @@ static u64 e12_rip0;
  * globale nell'asm di ept12_remap_main): la violation riflessa a L1 deve
  * avere questo RIP, non un RIP qualunque */
 extern char e12_np_read[];
+/* parere #75 §5: _sentinel, lettura e VMCALL di stage1 con etichette globali;
+ * e12_skip0_ok lo mette il gestore solo dopo lo skip VERIFICATO di stage0 */
+extern char e12_sent_read[], e12_sent_vmcall[];
+static int e12_skip0_ok;
 static int ept12_remap_rax_init(struct vmcs *vmcs)
 {
 	int r = ept12_remap_init(vmcs);
@@ -12918,6 +12923,23 @@ static void ept12_remap_main(void)
 	/* parere #74 §4: _np, lettura di stage1 con indirizzo noto a L1. Deve
 	 * dare una EPT violation riflessa; se invece riesce, il vmcall dopo
 	 * porta al gestore di stage1, che la dichiara FAIL. */
+	/* parere #75 §5: _sentinel, UN blocco asm (ordine fissato): lettura
+	 * della sonda, valore in e12_seen, marcatore scritto da L2 SOLO qui,
+	 * poi il VMCALL di stage1, entrambi con indirizzo noto a L1. */
+	if (e12_sentinel) {
+		asm volatile(".globl e12_sent_read\n"
+		    "e12_sent_read:\n\t"
+		    "movl (%[gpa]), %%eax\n\t"
+		    "movl %%eax, (%[seen])\n\t"
+		    "movl %[mark], (%[done])\n\t"
+		    ".globl e12_sent_vmcall\n"
+		    "e12_sent_vmcall:\n\t"
+		    "vmcall"
+		    :: [gpa] "r"(e12_gpa), [seen] "r"(&e12_seen),
+		       [done] "r"(&e12_s1_done), [mark] "i"(E12_S1_MARK)
+		    : "eax", "memory");
+		return;
+	}
 	if (e12_ept12np) {
 		asm volatile(".globl e12_np_read\n"
 		    "e12_np_read:\n\t"
@@ -13031,9 +13053,9 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			 * cosi' a stage1 si dimostra che la mov ha davvero prodotto il
 			 * valore letto (e non e' quello riciclato dallo stage0). */
 			if (e12_sentinel || e12_newgva) {
-				e12_seen = 0xdeadbeef;
-				e12_s1_val = 0xdeadbeef;
-				e12_s1_done = 0;
+				e12_seen = E12_GUARD;
+				e12_s1_val = E12_GUARD;
+				e12_s1_done = E12_GUARD;	/* parere #75: guardia, non 0 */
 			}
 			/* parere #61 §5: installa una NUOVA GVA (4K guest) mai letta,
 			 * che traduce alla STESSA GPA della sonda, sulla CR3 di L2. */
@@ -13101,7 +13123,26 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 					report_fail("MOV->RAX->VMCALL: valore inatteso %#x", rax);
 				return VMX_TEST_VMEXIT;
 			}
-			if (e12_sentinel || e12_newgva) {
+			if (e12_sentinel) {
+				/* parere #75 §5: PASS solo dall'oracolo composto
+				 * (e12_oracle.h), mai da un ramo singolo */
+				u64 rip1 = vmcs_read(GUEST_RIP);
+				enum e12_verdict v = e12_sentinel_verdict(e12_skip0_ok,
+				    e12_rip0, rip1, (u64)(unsigned long)e12_sent_vmcall,
+				    e12_s1_done, e12_seen, MAGIC_VAL_1, MAGIC_VAL_2);
+
+				printf("E12DIAG sentinella: skip0_ok=%d rip0=%#lx rip1=%#lx "
+				    "(atteso %#lx, lettura %#lx) marker=%#x (atteso %#x) "
+				    "seen=%#x (guardia %#x, MAGIC_1 %#x, MAGIC_2 %#x) -> %s\n",
+				    e12_skip0_ok, (unsigned long)e12_rip0,
+				    (unsigned long)rip1, (unsigned long)e12_sent_vmcall,
+				    (unsigned long)e12_sent_read, e12_s1_done,
+				    E12_S1_MARK, e12_seen, E12_GUARD, (u32)MAGIC_VAL_1,
+				    (u32)MAGIC_VAL_2, e12_verdict_str(v));
+				report(v == E12_PASS, "sentinella: %s", e12_verdict_str(v));
+				return VMX_TEST_VMEXIT;
+			}
+			if (e12_newgva) {
 				const char *tag = e12_newgva ?
 				    "newgva (GVA fresca -> stessa GPA)" : "sentinella";
 				unsigned long leaf2 = 0;
@@ -13175,6 +13216,11 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			    (unsigned long)rip_a,
 			    (unsigned long)vmcs_read(GUEST_RIP),
 			    vmx_get_test_stage());
+			/* parere #75: skip di stage0 VERIFICATO (dal VMCALL di
+			 * stage0, di 3 byte, appena passati allo stage 1) */
+			if (vmx_get_test_stage() == 1 && rip_a == e12_rip0 &&
+			    vmcs_read(GUEST_RIP) == rip_a + 3)
+				e12_skip0_ok = 1;
 		}
 		return VMX_TEST_RESUME;
 	case VMX_EPT_VIOLATION:
