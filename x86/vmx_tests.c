@@ -12823,6 +12823,10 @@ extern char e12_np_read[];
  * e12_skip0_ok lo mette il gestore solo dopo lo skip VERIFICATO di stage0 */
 extern char e12_sent_read[], e12_sent_vmcall[];
 static int e12_skip0_ok;
+/* parere #76: ept12_remap ordinario, indirizzi delle istruzioni di stage1 e
+ * stage2; e12_s2_fault_ok solo dopo la violation di scrittura verificata */
+extern char e12_s1_read[], e12_s1_vmcall[], e12_s2_write[], e12_s2_vmcall[];
+static int e12_s2_fault_ok;
 static int ept12_remap_rax_init(struct vmcs *vmcs)
 {
 	int r = ept12_remap_init(vmcs);
@@ -12958,12 +12962,37 @@ static void ept12_remap_main(void)
 	 * asm da L2 e' inaffidabile in questo harness nested). Per sentinella/newgva
 	 * e12_seen e' stata preimpostata a 0xdeadbeef nel gestore: se resta tale, la
 	 * mov non ha eseguito; MAGIC_1 = stantio; MAGIC_2 = pagina nuova. */
-	e12_seen = *(volatile u32 *)(e12_newgva ? e12_gva2 : e12_gpa);
-	vmcall();
-	/* stage 2 (revoca permesso) eseguito solo se il remap e' corretto */
-	if (vmx_get_test_stage() == 2) {
-		*(volatile u32 *)e12_gpa = MAGIC_VAL_3;
+	if (e12_newgva) {
+		e12_seen = *(volatile u32 *)e12_gva2;
 		vmcall();
+		return;
+	}
+	/* parere #76: percorso ordinario fail-closed, come _sentinel: UN asm
+	 * con lettura (e12_s1_read), valore, marcatore scritto da L2, VMCALL
+	 * (e12_s1_vmcall), tutti con indirizzo noto a L1 */
+	asm volatile(".globl e12_s1_read\n"
+	    "e12_s1_read:\n\t"
+	    "movl (%[gpa]), %%eax\n\t"
+	    "movl %%eax, (%[seen])\n\t"
+	    "movl %[mark], (%[done])\n\t"
+	    ".globl e12_s1_vmcall\n"
+	    "e12_s1_vmcall:\n\t"
+	    "vmcall"
+	    :: [gpa] "r"(e12_gpa), [seen] "r"(&e12_seen),
+	       [done] "r"(&e12_s1_done), [mark] "i"(E12_S1_MARK)
+	    : "eax", "memory");
+	/* stage 2 (revoca della scrittura) solo se il remap e' corretto: la
+	 * scrittura (e12_s2_write) DEVE fare EPT violation riflessa a L1; dopo
+	 * il ripristino viene rieseguita e si arriva a e12_s2_vmcall */
+	if (vmx_get_test_stage() == 2) {
+		asm volatile(".globl e12_s2_write\n"
+		    "e12_s2_write:\n\t"
+		    "movl %[v], (%[gpa])\n\t"
+		    ".globl e12_s2_vmcall\n"
+		    "e12_s2_vmcall:\n\t"
+		    "vmcall"
+		    :: [gpa] "r"(e12_gpa), [v] "i"((u32)MAGIC_VAL_3)
+		    : "memory");
 	}
 }
 
@@ -13052,7 +13081,8 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			/* parere #61 §3: azzera il canale del valore con una sentinella,
 			 * cosi' a stage1 si dimostra che la mov ha davvero prodotto il
 			 * valore letto (e non e' quello riciclato dallo stage0). */
-			if (e12_sentinel || e12_newgva) {
+			/* parere #76: guardie anche per il percorso ordinario */
+			if (e12_sentinel || e12_newgva || !e12_rax) {
 				e12_seen = E12_GUARD;
 				e12_s1_val = E12_GUARD;
 				e12_s1_done = E12_GUARD;	/* parere #75: guardia, non 0 */
@@ -13170,22 +13200,65 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			printf("E12DIAG stage1 l2_gpa=%#lx ept12_leaf=%#lx "
 			    "value_actual=%#x value_expected=%#x\n",
 			    e12_gpa, pte_now, e12_seen, (u32)MAGIC_VAL_2);
-			if (e12_seen != MAGIC_VAL_2) {
-				report_fail("EPT12 remap: lettura stantia "
-				    "(letto %#x, atteso %#x) -- STOP", e12_seen, (u32)MAGIC_VAL_2);
-				return VMX_TEST_VMEXIT;	/* stop al primo mismatch */
+			{
+				/* parere #76: stesso oracolo composto di _sentinel,
+				 * sulle etichette del percorso ordinario */
+				u64 rip1 = vmcs_read(GUEST_RIP);
+				enum e12_verdict v = e12_sentinel_verdict(e12_skip0_ok,
+				    e12_rip0, rip1, (u64)(unsigned long)e12_s1_vmcall,
+				    e12_s1_done, e12_seen, MAGIC_VAL_1, MAGIC_VAL_2);
+
+				printf("E12DIAG ordinario stage1: skip0_ok=%d rip0=%#lx rip1=%#lx "
+				    "(atteso %#lx, lettura %#lx) marker=%#x seen=%#x -> %s\n",
+				    e12_skip0_ok, (unsigned long)e12_rip0,
+				    (unsigned long)rip1, (unsigned long)e12_s1_vmcall,
+				    (unsigned long)e12_s1_read, e12_s1_done, e12_seen,
+				    e12_verdict_str(v));
+				if (v != E12_PASS) {
+					report_fail("EPT12 remap stage1: %s -- STOP",
+					    e12_verdict_str(v));
+					return VMX_TEST_VMEXIT;
+				}
 			}
 			report_pass("EPT12 remap: L2 legge la pagina NUOVA, non la stantia");
 			/* revoca il permesso di scrittura + INVEPT */
 			install_ept(pml4, (unsigned long)data_page2,
 			    (unsigned long)data_page2, EPT_RA | EPT_EA);
+			get_ept_pte(pml4, e12_gpa, 1, &pte_now);
+			printf("E12DIAG stage2 revoca W: ept12_leaf=%#lx (atteso R-X)\n",
+			    pte_now);
+			if ((pte_now & (EPT_RA | EPT_WA | EPT_EA)) != (EPT_RA | EPT_EA)) {
+				report_fail("EPT12 revoca: foglia %#lx non R-X -- STOP",
+				    pte_now);
+				return VMX_TEST_VMEXIT;
+			}
 			e12_invept();
 			vmx_inc_test_stage();
 			break;
 		}
-		case 3:
-			report_pass("EPT12: scrittura ripresa dopo il ripristino del permesso");
+		case 2:
+			/* parere #76: la scrittura di stage2 NON ha fatto la
+			 * violation ed e' arrivata al VMCALL: permesso violato */
+			report_fail("EPT12 revoca: scrittura RIUSCITA con EPT12 R-X (vmcall rip=%#lx, pagina=%#x)",
+			    (unsigned long)vmcs_read(GUEST_RIP),
+			    *(volatile u32 *)data_page2);
 			return VMX_TEST_VMEXIT;
+		case 3: {
+			u64 rip3 = vmcs_read(GUEST_RIP);
+			u32 pv = *(volatile u32 *)data_page2;
+			enum e12_s3_verdict v3 = e12_s3_verdict(e12_s2_fault_ok,
+			    rip3, (u64)(unsigned long)e12_s2_vmcall, pv,
+			    (u32)MAGIC_VAL_3);
+
+			printf("E12DIAG stage3: s2_fault_ok=%d rip3=%#lx (atteso %#lx) pagina=%#x (atteso %#x) -> %s\n",
+			    e12_s2_fault_ok, (unsigned long)rip3,
+			    (unsigned long)e12_s2_vmcall, pv, (u32)MAGIC_VAL_3,
+			    e12_s3_str(v3));
+			report(v3 == E12_S3_PASS,
+			    "EPT12: scrittura ripresa dopo il ripristino del permesso: %s",
+			    e12_s3_str(v3));
+			return VMX_TEST_VMEXIT;
+		}
 		default:
 			report_fail("EPT12: stage VMCALL inatteso %d",
 			    vmx_get_test_stage());
@@ -13263,7 +13336,26 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			    (unsigned long)qual);
 			return VMX_TEST_VMEXIT;
 		}
-		if (vmx_get_test_stage() == 2 && (qual & EPT_VLT_WR)) {
+		if (vmx_get_test_stage() == 2) {
+			/* parere #76: violation di SCRITTURA dall'istruzione di
+			 * stage2, sulla sonda, con permessi EPT12 R-X riportati;
+			 * altrimenti STOP. Nessuno skip: la scrittura va rieseguita */
+			u64 gpa = vmcs_read(INFO_PHYS_ADDR);
+			u64 rip = vmcs_read(GUEST_RIP);
+			int ok = e12_s2_fault_check(gpa, e12_gpa, rip,
+			    (u64)(unsigned long)e12_s2_write, qual);
+
+			printf("E12DIAG stage2 violation gpa=%#lx rip=%#lx (scrittura %#lx) qual=%#lx -> %s\n",
+			    (unsigned long)gpa, (unsigned long)rip,
+			    (unsigned long)e12_s2_write, (unsigned long)qual,
+			    ok ? "ok" : "NON conforme");
+			if (!ok) {
+				report_fail("EPT12 revoca: violation non conforme (gpa %#lx rip %#lx qual %#lx) -- STOP",
+				    (unsigned long)gpa, (unsigned long)rip,
+				    (unsigned long)qual);
+				return VMX_TEST_VMEXIT;
+			}
+			e12_s2_fault_ok = 1;
 			report_pass("EPT12 revoca permesso: la scrittura ha fatto EPT violation");
 			/* ripristina il permesso di scrittura e riprendi */
 			install_ept(pml4, (unsigned long)data_page2,

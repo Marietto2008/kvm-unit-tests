@@ -65,4 +65,55 @@ e12_verdict_str(enum e12_verdict v)
 	return ("FAIL: esito sconosciuto");
 }
 
+/*
+ * Parere #76, ept12_remap ordinario, stage 2: la scrittura sulla sonda con
+ * EPT12 R-X deve arrivare a L1 come EPT violation di SCRITTURA (bit 1), dalla
+ * istruzione di scrittura (write_addr), sulla pagina della sonda, con i
+ * permessi EPT12 riportati nei bit 5:3 = R-X (0b101). Ritorna 1 solo se tutto.
+ */
+static inline int
+e12_s2_fault_check(unsigned long long gpa, unsigned long long probe,
+    unsigned long long rip, unsigned long long write_addr,
+    unsigned long long qual)
+{
+	return ((gpa & ~0xfffull) == (probe & ~0xfffull) &&
+	    rip == write_addr &&
+	    (qual & 0x2) != 0 &&
+	    ((qual >> 3) & 0x7) == 0x5);
+}
+
+enum e12_s3_verdict {
+	E12_S3_PASS = 0,
+	E12_S3_F_NOFAULT,	/* la scrittura non ha fatto la violation attesa */
+	E12_S3_F_RIP,		/* VMCALL di stage3 non all'indirizzo atteso */
+	E12_S3_F_VALUE,		/* la pagina non contiene il valore scritto */
+};
+
+/* Stage 3: PASS solo con violation di stage 2 verificata, VMCALL finale
+ * all'indirizzo atteso e il valore scritto da L2 visibile nella pagina. */
+static inline enum e12_s3_verdict
+e12_s3_verdict(int s2_fault_ok, unsigned long long rip3,
+    unsigned long long vmcall_addr, unsigned int page_val, unsigned int magic3)
+{
+	if (!s2_fault_ok)
+		return (E12_S3_F_NOFAULT);
+	if (rip3 != vmcall_addr)
+		return (E12_S3_F_RIP);
+	if (page_val != magic3)
+		return (E12_S3_F_VALUE);
+	return (E12_S3_PASS);
+}
+
+static inline const char *
+e12_s3_str(enum e12_s3_verdict v)
+{
+	switch (v) {
+	case E12_S3_PASS:	return ("PASS");
+	case E12_S3_F_NOFAULT:	return ("FAIL: la scrittura di stage2 non ha fatto la violation attesa");
+	case E12_S3_F_RIP:	return ("FAIL: VMCALL di stage3 a un indirizzo inatteso");
+	case E12_S3_F_VALUE:	return ("FAIL: la pagina non contiene il valore scritto da L2");
+	}
+	return ("FAIL: esito sconosciuto");
+}
+
 #endif
