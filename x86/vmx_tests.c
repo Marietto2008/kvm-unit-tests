@@ -12675,6 +12675,98 @@ static void vmx_vpid_crossvm_test(void)
 	test_set_guest_finished();
 }
 
+/*
+ * Claude 26/10/2026 -- parere #56 §3: test EPT12 DISCRIMINANTE (il "remap" della
+ * suite ept fa report_pass su entrambi i rami, non e' stringente). Qui il
+ * confronto e' inequivocabile: dopo che L1 rimappa l'EPT12 su un'altra pagina
+ * fisica (marcatore diverso) e fa INVEPT, L2 DEVE leggere il nuovo valore; una
+ * lettura stantia e' report_fail. Poi L1 revoca il permesso di scrittura: la
+ * scrittura di L2 DEVE dare EPT violation. Sotto migratore.sh esercita il caso
+ * CPU 6<->7. Con l'INVEPT incondizionato (opt=0) deve passare.
+ */
+static volatile u32 e12_seen;
+static unsigned long e12_gpa;
+
+static int ept12_remap_init(struct vmcs *vmcs)
+{
+	int r = ept_init_common(false);	/* mapping collaudato: data_page1/2 a 4K */
+
+	if (r != VMX_TEST_START)
+		return r;
+	/*
+	 * ept_init_common ha gia' fatto install_ept(data_page1_hpa,
+	 * data_page2_gpa): la GPA di data_page2 risolve alla pagina fisica di
+	 * data_page1 (MAGIC_VAL_1). La sonda e' data_page2.
+	 */
+	e12_gpa = (unsigned long)data_page2;
+	vmx_set_test_stage(0);
+	return VMX_TEST_START;
+}
+
+static void ept12_remap_main(void)
+{
+	e12_seen = *(volatile u32 *)e12_gpa;	/* stage 0: attesa MAGIC_VAL_1 (pagina di data_page1) */
+	vmcall();
+	e12_seen = *(volatile u32 *)e12_gpa;	/* stage 1: DEVE essere MAGIC_VAL_2 (pagina di data_page2) */
+	vmcall();
+	*(volatile u32 *)e12_gpa = MAGIC_VAL_3;	/* stage 2: scrittura -> EPT violation attesa */
+	vmcall();				/* raggiunto solo dopo il ripristino del permesso */
+}
+
+static int ept12_remap_exit(union exit_reason exit_reason)
+{
+	u64 qual = vmcs_read(EXI_QUALIFICATION);
+
+	switch (exit_reason.basic) {
+	case VMX_VMCALL:
+		switch (vmx_get_test_stage()) {
+		case 0:
+			report(e12_seen == MAGIC_VAL_1,
+			    "EPT12: L2 legge la pagina iniziale (data_page1)");
+			/* rimappa GPA(data_page2) sulla propria pagina fisica + INVEPT */
+			install_ept(pml4, (unsigned long)data_page2,
+			    (unsigned long)data_page2, EPT_RA | EPT_WA | EPT_EA);
+			invept(INVEPT_SINGLE, eptp);
+			vmx_inc_test_stage();
+			break;
+		case 1:
+			report(e12_seen == MAGIC_VAL_2,
+			    "EPT12 remap: L2 legge la pagina NUOVA, non la stantia");
+			/* revoca il permesso di scrittura + INVEPT */
+			install_ept(pml4, (unsigned long)data_page2,
+			    (unsigned long)data_page2, EPT_RA | EPT_EA);
+			invept(INVEPT_SINGLE, eptp);
+			vmx_inc_test_stage();
+			break;
+		case 3:
+			report_pass("EPT12: scrittura ripresa dopo il ripristino del permesso");
+			return VMX_TEST_VMEXIT;
+		default:
+			report_fail("EPT12: stage VMCALL inatteso %d",
+			    vmx_get_test_stage());
+			return VMX_TEST_VMEXIT;
+		}
+		return VMX_TEST_RESUME;
+	case VMX_EPT_VIOLATION:
+		if (vmx_get_test_stage() == 2 && (qual & EPT_VLT_WR)) {
+			report_pass("EPT12 revoca permesso: la scrittura ha fatto EPT violation");
+			/* ripristina il permesso di scrittura e riprendi */
+			install_ept(pml4, (unsigned long)data_page2,
+			    (unsigned long)data_page2, EPT_RA | EPT_WA | EPT_EA);
+			invept(INVEPT_SINGLE, eptp);
+			vmx_inc_test_stage();
+			return VMX_TEST_RESUME;
+		}
+		report_fail("EPT12: EPT violation inattesa (stage %d, qual %#lx)",
+		    vmx_get_test_stage(), (unsigned long)qual);
+		return VMX_TEST_VMEXIT;
+	default:
+		report_fail("EPT12: uscita inattesa 0x%x", exit_reason.full);
+		print_vmexit_info(exit_reason);
+	}
+	return VMX_TEST_VMEXIT;
+}
+
 static void vmx_l2_ac_test(void)
 {
 	bool hit_ac = false;
@@ -13440,6 +13532,7 @@ struct vmx_test vmx_tests[] = {
 	{ "instruction intercept", insn_intercept_init, insn_intercept_main,
 		insn_intercept_exit_handler },
 	{ "EPT A/D disabled", ept_init, ept_main, ept_exit_handler },
+	{ "ept12_remap", ept12_remap_init, ept12_remap_main, ept12_remap_exit },
 	{ "EPT A/D enabled", eptad_init, eptad_main, eptad_exit_handler },
 	{ "PML", pml_init, pml_main, pml_exit_handler },
 	{ "interrupt", interrupt_init, interrupt_main, interrupt_exit_handler },
