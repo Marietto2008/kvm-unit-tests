@@ -13102,6 +13102,16 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 			    vmx_get_test_stage());
 			return VMX_TEST_VMEXIT;
 		}
+		/*
+		 * Il VM-exit per VMCALL NON fa avanzare il RIP (lo fa il
+		 * gestore) e vmx_run del framework rientra con "continue".
+		 * Senza questa riga L2 rieseguiva lo STESSO vmcall di stage0:
+		 * la lettura di stage1 non veniva mai eseguita e il gestore di
+		 * stage1 trovava e12_seen/RAX ancora col valore di stage0
+		 * (falso "stantio"). Prova: diag58, uscita VMCALL di stage0 e
+		 * di "stage1" con lo stesso RIP (0x40e543/0x40e543).
+		 */
+		skip_exit_vmcall();
 		return VMX_TEST_RESUME;
 	case VMX_EPT_VIOLATION:
 		if ((e12_newgva || e12_sentinel || e12_rax) && vmx_get_test_stage() == 1) {
