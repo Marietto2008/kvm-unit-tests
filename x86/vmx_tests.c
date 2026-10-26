@@ -12811,6 +12811,9 @@ static int ept12_remap_np_init(struct vmcs *vmcs)
  * gestore lo legge dal GPR salvato (this_cpu_guest_regs()->rax), canale
  * INDIPENDENTE dalla pagina condivisa del test. */
 static int e12_rax;
+/* parere #73 §4: RIP del VMCALL di stage0, per provare che il VMCALL di stage1
+ * e' un'istruzione DIVERSA (cioe' che il codice di stage1 e' stato eseguito) */
+static u64 e12_rip0;
 static int ept12_remap_rax_init(struct vmcs *vmcs)
 {
 	int r = ept12_remap_init(vmcs);
@@ -12933,6 +12936,12 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 
 	switch (exit_reason.basic) {
 	case VMX_VMCALL:
+		if (vmx_get_test_stage() == 0) {
+			e12_rip0 = vmcs_read(GUEST_RIP);
+			printf("E12DIAG vmcall stage0 rip=%#lx len=%u\n",
+			    (unsigned long)e12_rip0,
+			    (unsigned)vmcs_read(EXI_INST_LEN));
+		}
 		switch (vmx_get_test_stage()) {
 		case 0: {
 			unsigned long pte_before = 0, pte_after = 0;
@@ -13041,11 +13050,21 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 				/* parere #62/#66: valore letto da L2, preso dal GPR
 				 * salvato (NON dalla pagina condivisa del test). */
 				u32 rax = (u32)this_cpu_guest_regs()->rax;
+				u64 rip1 = vmcs_read(GUEST_RIP);
 				unsigned long pte_now = 0;
 				get_ept_pte(pml4, e12_gpa, 1, &pte_now);
+				printf("E12DIAG vmcall stage1 rip=%#lx (stage0 rip=%#lx) len=%u\n",
+				    (unsigned long)rip1, (unsigned long)e12_rip0,
+				    (unsigned)vmcs_read(EXI_INST_LEN));
 				printf("E12DIAG RAX: eax=%#x (MAGIC_1=%#x stantio, MAGIC_2=%#x nuovo) ept12_leaf=%#lx\n",
 				    rax, (u32)MAGIC_VAL_1, (u32)MAGIC_VAL_2, pte_now);
-				if (rax == MAGIC_VAL_2)
+				/* parere #73 §4.4: senza un VMCALL di stage1 DISTINTO
+				 * la mov di stage1 non e' provata: inconclusivo, mai
+				 * PASS ne' "stantio" */
+				if (rip1 == e12_rip0)
+					report_fail("MOV->RAX->VMCALL: INCONCLUSIVO, VMCALL di stage1 = VMCALL di stage0 (rip %#lx): stage1 non eseguita",
+					    (unsigned long)rip1);
+				else if (rax == MAGIC_VAL_2)
 					report_pass("MOV->RAX->VMCALL: L2 legge la pagina NUOVA (data_page2) via GPR salvato");
 				else if (rax == MAGIC_VAL_1)
 					report_fail("MOV->RAX->VMCALL: L2 legge STANTIO (data_page1) via GPR salvato, senza EPT violation");
@@ -13111,15 +13130,34 @@ static int ept12_remap_exit(union exit_reason exit_reason)
 		 * (falso "stantio"). Prova: diag58, uscita VMCALL di stage0 e
 		 * di "stage1" con lo stesso RIP (0x40e543/0x40e543).
 		 */
-		skip_exit_vmcall();
+		{
+			/* parere #73 §4.3: si salta solo un VMCALL vero, di
+			 * lunghezza 3; altrimenti fail-closed, nessun salto */
+			u64 rip_a = vmcs_read(GUEST_RIP);
+			u32 len = vmcs_read(EXI_INST_LEN);
+
+			if (len != 3) {
+				report_fail("EPT12: VMCALL con lunghezza %u (attesa 3) a rip %#lx: STOP",
+				    len, (unsigned long)rip_a);
+				return VMX_TEST_VMEXIT;
+			}
+			skip_exit_vmcall();	/* verifica anche exit reason == VMCALL */
+			printf("E12DIAG skip vmcall: rip %#lx -> %#lx (stage ora %d)\n",
+			    (unsigned long)rip_a,
+			    (unsigned long)vmcs_read(GUEST_RIP),
+			    vmx_get_test_stage());
+		}
 		return VMX_TEST_RESUME;
 	case VMX_EPT_VIOLATION:
 		if ((e12_newgva || e12_sentinel || e12_rax) && vmx_get_test_stage() == 1) {
 			u64 gpa = vmcs_read(INFO_PHYS_ADDR);
 			if ((gpa & ~0xfffUL) == (e12_gpa & ~0xfffUL)) {
-				report_pass("%s: la lettura ha fatto EPT violation sulla sonda (gpa=%#lx)",
+				/* parere #73: dopo il remap l'EPT12 MAPPA la sonda
+				 * (data_page2, RWX): una violation riflessa a L1 e'
+				 * un errore di L0, non un successo (prima: PASS) */
+				report_fail("%s: EPT violation sulla sonda RIFLESSA a L1 (gpa=%#lx qual=%#lx) benche' l'EPT12 la mappi",
 				    e12_rax ? "RAX" : (e12_newgva ? "newgva" : "sentinella"),
-				    (unsigned long)gpa);
+				    (unsigned long)gpa, (unsigned long)qual);
 				return VMX_TEST_VMEXIT;
 			}
 			/* violazione su altra GPA: ricostruzione, si prosegue */
