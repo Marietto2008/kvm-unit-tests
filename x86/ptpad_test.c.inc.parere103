@@ -1,0 +1,190 @@
+/*
+ * ptpad_test.c.inc -- Claude 27/10/2026, pareri #100/#101. Test deterministico per l'audit
+ * AUDIT-PTP-HOLD: l'emulazione di un'istruzione di L2 da parte di L0 (bhyve) percorre le
+ * tabelle di paging di L2 e vi aggiorna i bit A/D. H1: lo fa anche quando la pagina di tabelle
+ * (T) e' mappata in EPT12 senza W, senza riflettere una EPT violation a L1. H2: una traduzione
+ * nested fallita diventa un errore fatale dell'hypervisor invece di una EPT violation.
+ *
+ * NB (parere #102 §1): i bit toccati sono A (bit 5) e D (bit 6) delle PTE ORDINARIE di L2,
+ * aggiornati dal walker SEMPRE, a prescindere dagli A/D di EPT. NON si usano gli A/D di EPT12
+ * (EPTP12[6]): L0 non espone quella capacita' a L1 (vmx_nested.c:374), quindi il test IMPONE
+ * EPTP12[6]=0. Confondere i due meccanismi farebbe fallire il VM-entry di L2 prima di H1/H2.
+ *
+ * NON e' ancora compilato ne' eseguito. Da inserire in x86/vmx_tests.c (una funzione + una
+ * riga TEST). L1 = questo test sotto bhyve; L2 = il guest che fa un singolo movsq.
+ *
+ * Idea: L2 fa `movsq` con sorgente M (MMIO emulata da L0 per L1: il runner conferma col delta
+ * di nested_ept_mmio_emulated) e destinazione D (RAM). La pagina T che contiene la PTE foglia di
+ * D viene mappata in EPT12 R-only (clear EPT_WA) e la PTE di D azzerata nei bit A/D secondo il
+ * caso. L'oracolo e' TUTTO dentro L1: L1 vede o no la EPT violation riflessa da L0.
+ *
+ * L1 stampa una riga per caso che il runner combina con le fotografie del contatore host:
+ *   PTPAD CASE <nome>
+ *   PTPAD L1 viol=<0|1> reason=<n> qual=<hex> gpa=<hex> paddr=<0|1> pte0=<hex> pte1=<hex> dwr=<0|1> ripadv=<0|1>
+ * I casi D (D_DATA, D_PTP) possono NON tornare: il runner rileva la morte di bhyve.
+ */
+
+/* M: sorgente MMIO emulata da L0. Il runner verifica col contatore che l'accesso sia EMULATO;
+ * altrimenti l'oracolo classifica INCONCLUSIVE_*. 0xfec00000 = IOAPIC (emulato da bhyve). */
+#define PTPAD_MMIO	0xfec00000ul
+
+enum { PTPAD_B, PTPAD_C, PTPAD_A, PTPAD_A_D, PTPAD_D_DATA, PTPAD_D_PTP };
+static const char *ptpad_nome[] = { "B", "C", "A", "A_D", "D_DATA", "D_PTP" };
+
+static volatile u64 ptpad_src, ptpad_dst;	/* indirizzi usati da L2 */
+static volatile int ptpad_done;
+
+/* L2: INVLPG su D (parere #103 §2: INVEPT NON invalida le traduzioni LINEARI; INVLPG nel
+ * contesto/VPID di L2 forza il re-walk della PTE ordinaria modificata da L1 fra i casi), poi un
+ * singolo movsq da [ptpad_src] a [ptpad_dst], poi vmcall. Niente REP. */
+static void ptpad_l2(void)
+{
+	for (;;) {
+		asm volatile(
+			"invlpg (%1)\n\t"
+			"movq %0, %%rsi\n\t"
+			"movq %1, %%rdi\n\t"
+			"movsq\n\t"
+			: : "r"(ptpad_src), "r"(ptpad_dst) : "rsi", "rdi", "memory");
+		ptpad_done = 1;
+		vmcall();
+	}
+}
+
+/* indirizzo in L1 della PTE foglia di `va` nelle tabelle del guest (cr3) */
+static u64 *ptpad_leaf_pte(u64 cr3, u64 va)
+{
+	unsigned long *pt = (unsigned long *)(cr3 & PT_ADDR_MASK);
+	int l;
+	unsigned off;
+	u64 pte;
+
+	for (l = 4; l >= 1; l--) {
+		off = (va >> (12 + 9 * (l - 1))) & 511;
+		if (l == 1)
+			return (u64 *)&pt[off];
+		pte = pt[off];
+		if (!(pte & PT_PRESENT_MASK) || (pte & PT_PAGE_SIZE_MASK))
+			return NULL;	/* serve una foglia 4K isolata */
+		pt = (unsigned long *)(pte & PT_ADDR_MASK);
+	}
+	return NULL;
+}
+
+static void vmx_ptpad_fidelity_test(void)
+{
+	u64 cr3, *ptep, pte0, pte1, qual, gpa, va_d;
+	unsigned long end_of_memory, pageT;
+	void *dpage;
+	int caso, reason;
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s: EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	/* parere #102 §1: NIENTE ept_enable_ad_bits(). I bit A/D ordinari di L2 li aggiorna il
+	 * walker comunque. EPTP12[6] DEVE essere 0 (capacita' non esposta da L0). */
+	TEST_ASSERT(!(eptp & EPTP_AD_FLAG));
+	printf("PTPAD CTX eptp_ad=%d vmcs_eptp_ad=%d cap21=%d cr0=%lx cr3=%lx cr4=%lx efer=%lx\n",
+	    !!(eptp & EPTP_AD_FLAG), !!(vmcs_read(EPTP) & EPTP_AD_FLAG),
+	    !!(ept_vpid.val & (1ull << 21)), read_cr0(), read_cr3(), read_cr4(), rdmsr(MSR_EFER));
+	end_of_memory = fwcfg_get_u64(FW_CFG_RAM_SIZE);
+	if (end_of_memory < (1ul << 32))
+		end_of_memory = (1ul << 32);
+
+	dpage = alloc_page();
+	va_d = (u64)dpage;			/* identita': va L2 = L1-GPA = HPA */
+	cr3 = read_cr3();
+	ptep = ptpad_leaf_pte(cr3, va_d);	/* PTE ORDINARIA di L2 della destinazione */
+	if (!ptep) {
+		report_skip("%s: PTE di D non su foglia 4K isolata", __func__);
+		return;
+	}
+	pageT = (unsigned long)ptep & ~(PAGE_SIZE - 1);	/* pagina T con la PTE di D */
+	/* parere #103 §6.2: T NON deve coincidere con la pagina di tabelle che mappa il codice di
+	 * L2 o la sorgente M; altrimenti rimuovere/proteggere T in D_PTP farebbe fallire il fetch o
+	 * la lettura di M, non il walk di D. */
+	{
+		u64 *ptc = ptpad_leaf_pte(cr3, (u64)ptpad_l2);
+		u64 *ptm = ptpad_leaf_pte(cr3, PTPAD_MMIO);
+		if (!ptc || !ptm ||
+		    pageT == ((unsigned long)ptc & ~(PAGE_SIZE - 1)) ||
+		    pageT == ((unsigned long)ptm & ~(PAGE_SIZE - 1))) {
+			report_skip("%s: T non isolata da codice/M (pagine di tabelle condivise)", __func__);
+			return;
+		}
+	}
+	ptpad_src = PTPAD_MMIO;
+	ptpad_dst = va_d;
+	test_set_guest(ptpad_l2);
+
+	for (caso = PTPAD_B; caso <= PTPAD_D_PTP; caso++) {
+		printf("PTPAD CASE %s\n", ptpad_nome[caso]);
+
+		/* EPT12: riparti da identita' R+W+X su tutto, poi applica il caso */
+		install_ept(pml4, pageT, pageT, EPT_PRESENT);
+		install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, EPT_PRESENT);
+		install_ept(pml4, PTPAD_MMIO, PTPAD_MMIO, EPT_RA);	/* MMIO sola lettura: sorgente */
+
+		/* PTE di D e permessi di T e D secondo il caso */
+		pte0 = *ptep;
+		switch (caso) {
+		case PTPAD_B:		/* controllo +: T RW, A/D=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_PRESENT);	/* RW */
+			break;
+		case PTPAD_C:		/* controllo -: T R-only, A/D gia' 1 */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			install_ept(pml4, pageT, pageT, EPT_RA);	/* R, no W */
+			break;
+		case PTPAD_A:		/* H1: T R-only, A=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_A_D:		/* H1 su PG_M: A=1, D=0 */
+			*ptep = (pte0 | PT_ACCESSED_MASK) & ~PT_DIRTY_MASK;
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_D_DATA:	/* H2: D non mappata in EPT12 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_PRESENT);	/* T ok */
+			install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, 0); /* D assente */
+			break;
+		case PTPAD_D_PTP:	/* H2: T non mappata -> il walk LEGGE la PTE: violazione di LETTURA su T */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, 0);		/* T assente */
+			break;
+		}
+		pte0 = *ptep;
+		*(volatile u64 *)dpage = 0;		/* D azzerata: dwr osservabile */
+		invept(INVEPT_SINGLE, eptp);
+		ptpad_done = 0;
+
+		/* il runner fotografa il contatore host QUI, alla riga CASE, e dopo enter_guest */
+		enter_guest();
+		reason = vmcs_read(EXI_REASON) & 0xff;
+		if (reason == VMX_EPT_VIOLATION) {
+			qual = vmcs_read(EXI_QUALIFICATION);
+			gpa = vmcs_read(INFO_PHYS_ADDR);
+			pte1 = *ptep;
+			printf("PTPAD L1 viol=1 reason=%d qual=%lx gpa=%lx paddr=%d pte0=%lx pte1=%lx dwr=%d ripadv=0\n",
+			    reason, qual, gpa, !!(qual & EPT_VLT_PADDR), pte0, pte1,
+			    *(volatile u64 *)dpage != 0);
+			/* non si rientra nell'istruzione: si passa al caso dopo */
+		} else if (reason == VMX_VMCALL) {
+			pte1 = *ptep;
+			printf("PTPAD L1 viol=0 reason=%d qual=0 gpa=0 paddr=0 pte0=%lx pte1=%lx dwr=%d ripadv=%d\n",
+			    reason, pte0, pte1, *(volatile u64 *)dpage != 0, ptpad_done);
+			skip_exit_vmcall();
+		} else {
+			printf("PTPAD L1 viol=0 reason=%d qual=0 gpa=0 paddr=0 pte0=%lx pte1=%lx dwr=0 ripadv=0\n",
+			    reason, pte0, *ptep);
+		}
+		*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;	/* ripulisci per il caso dopo */
+	}
+	report(true, "%s: tutti i casi eseguiti (verdetto OFFLINE con ptpad_an.py)", __func__);
+}
+
+/* Registrazione: aggiungere nella tabella vmx_tests[]:
+ *     TEST(vmx_ptpad_fidelity_test),
+ */

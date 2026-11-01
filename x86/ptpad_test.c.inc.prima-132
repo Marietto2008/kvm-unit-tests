@@ -1,0 +1,537 @@
+/*
+ * ptpad_test.c.inc -- Claude 27/10/2026, pareri #100/#101. Test deterministico per l'audit
+ * AUDIT-PTP-HOLD: l'emulazione di un'istruzione di L2 da parte di L0 (bhyve) percorre le
+ * tabelle di paging di L2 e vi aggiorna i bit A/D. H1: lo fa anche quando la pagina di tabelle
+ * (T) e' mappata in EPT12 senza W, senza riflettere una EPT violation a L1. H2: una traduzione
+ * nested fallita diventa un errore fatale dell'hypervisor invece di una EPT violation.
+ *
+ * NB (parere #102 §1): i bit toccati sono A (bit 5) e D (bit 6) delle PTE ORDINARIE di L2,
+ * aggiornati dal walker SEMPRE, a prescindere dagli A/D di EPT. NON si usano gli A/D di EPT12
+ * (EPTP12[6]): L0 non espone quella capacita' a L1 (vmx_nested.c:374), quindi il test IMPONE
+ * EPTP12[6]=0. Confondere i due meccanismi farebbe fallire il VM-entry di L2 prima di H1/H2.
+ *
+ * NON e' ancora compilato ne' eseguito. Da inserire in x86/vmx_tests.c (una funzione + una
+ * riga TEST). L1 = questo test sotto bhyve; L2 = il guest che fa un singolo movsq.
+ *
+ * Idea: L2 fa `movsq` con sorgente M (MMIO emulata da L0 per L1: il runner conferma col delta
+ * di nested_ept_mmio_emulated) e destinazione D (RAM). La pagina T che contiene la PTE foglia di
+ * D viene mappata in EPT12 R-only (clear EPT_WA) e la PTE di D azzerata nei bit A/D secondo il
+ * caso. L'oracolo e' TUTTO dentro L1: L1 vede o no la EPT violation riflessa da L0.
+ *
+ * L1 stampa una riga per caso che il runner combina con le fotografie del contatore host:
+ *   PTPAD CASE <nome>
+ *   PTPAD L1 viol=<0|1> reason=<n> qual=<hex> gpa=<hex> paddr=<0|1> pte0=<hex> pte1=<hex> dwr=<0|1> ripadv=<0|1>
+ * I casi D (D_DATA, D_PTP) possono NON tornare: il runner rileva la morte di bhyve.
+ *
+ * Parere #106 (D1, D2): il PIANO e l'avanzamento li da' l'HOST, sulla COM1 in ingresso.
+ *   host -> L1: "<piano>\n"  es. "B,C,A,A_D"  (B primo, al piu' UN caso D, e per ultimo)
+ *   L1 -> host: "PTPAD PLAN cases=<piano>"   (eco: il log porta il piano EFFETTIVO)
+ *   per ogni caso: L1 stampa "PTPAD CASE <nome>" e si FERMA finche' l'host, letto il contatore,
+ *   non manda 'g'. Senza piano o senza ACK entro PTPAD_ATTESA cicli TSC: nessun caso eseguito
+ *   (report_skip / "PTPAD NOACK"). Una corsa della .flat SENZA il runner non esegue nulla.
+ *   La stampa di L1 e' PIO sulla COM1: non tocca nested_ept_mmio_emulated (solo MMIO di L2).
+ *
+ * Caso H (sessione 1c, 27/10): A e A_D hanno riprodotto H1, ma restava possibile che il R-only di T
+ * in EPT12 non fosse in vigore AFFATTO (INVEPT/shadow EPT02). H e H_D ripetono A e A_D con la stessa
+ * T, la stessa PTE e gli stessi permessi, ma L2 fa una scrittura ORDINARIA su D (nessun MMIO, nessuna
+ * emulazione): gli A/D li aggiorna l'HARDWARE. Atteso: EPT violation di scrittura su T riflessa a L1
+ * (bit1, bit7, bit8=0, gpa = indirizzo della PTE), PTE e D invariate, nested_ept_mmio_emulated +0 e
+ * nested_ept12_viol_reflected +1. Se arriva, la protezione e' attiva e H1 e' dell'emulatore.
+ * L2 e' in asm, senza stack: a ogni caso L1 riporta GUEST_RIP all'inizio (dopo una violazione il
+ * caso dopo NON riparte dall'istruzione che l'ha causata) e alla fine dichiara il guest finito.
+ *
+ * H2 (29/10, parere #119 §3.2): HD_DATA e HD_PTP sono i controlli HARDWARE di D_DATA e D_PTP: stesse
+ * pagine e stessi permessi (D, o T, NON presente in EPT12) ma L2 fa la scrittura ORDINARIA su D. La
+ * violazione la produce il walk hardware e L0 la riflette dal percorso dello shadow EPT con la
+ * qualificazione dell'HARDWARE (bit 9-11 compresi): e' il riferimento con cui confrontare quella che,
+ * con la correzione di H2, costruisce l'emulatore nei casi D. Non sono casi D (non emulano): stanno
+ * PRIMA di D_DATA nell'enum. Resta al piu' UN caso D per sessione, per ultimo.
+ *
+ * H2-AD (30/10, parere #123 §3): la campagna H2-only ha visto l'emulatore accendere A/D nella PTE foglia
+ * prima del diniego finale, l'hardware no. Per i livelli SUPERIORI nessun oracolo: avevano gia' A=1. Casi
+ * _PDE (A=0 nella PDE di D) e _ALL (A=0 in PML4E, PDPTE e PDE di D), per il dato e per la tabella (T non
+ * presente). Per OGNI caso una riga PTPAD LIV con il valore dei quattro livelli del walk di D subito prima
+ * dell'ingresso in L2 e subito dopo l'uscita: old>new. Le voci superiori di va_d (PML4E[511], PDPTE[511],
+ * PDE di D) non sono percorse ne' dal codice di L2 ne' da M (PML4E[0]).
+ *
+ * G1 (30/10, parere #124 §2): PRECEDENZA fra due dinieghi. _CONFLICT: T senza W, PTE di D con A=D=0 e D non
+ * presente; _CONFLICT_PDE: la pagina della PD senza W, PDE di D con A=0, PTE con A=D=1 e D non presente. Quale
+ * violazione vede l'L1, quella della scrittura A/D sulla tabella (gpa = la voce, bit8=0) o quella del dato
+ * (gpa = D, bit8=1)? La MAP porta anche pdeaddr.
+ *
+ * G1b (30/10, parere #126): H_PDE = controllo POSITIVO di _CONFLICT_PDE (PD senza W, PDE A=0, PTE A=D=1, D
+ * PRESENTE: atteso la violazione di scrittura sulla PDE). Per ogni caso una riga PTPAD EPT con le voci foglia di
+ * EPT12 di T, della pagina della PD e di D, lette subito prima dell'ingresso in L2: controllo e conflitto devono
+ * differire SOLO per D.
+ *
+ * H2_MMIO (31/10, parere #131): EPT12 manda T (la PT di D) su un L1-GPA SENZA backing in L0. HM_RAM = controllo
+ * positivo (T -> Y', una pagina RAM di L1 con la COPIA di T: il walk deve riuscire); HM_PTP = scrittura ORDINARIA
+ * con T -> Y (percorso hardware); DM_PTP = movsq emulato con T -> Y (ultimo, VM terminale). Una volta per sessione:
+ * PTPAD MEM (RAM di L1, Y, Y'), PTPAD FIXMMIO (IOAPIC, HPET, LAPIC) e una PTPAD BAR per ogni BAR PCI del bus 0
+ * (e le finestre dei bridge): l'oracolo rifiuta HM/DM se una di queste copre Y.
+ */
+#define PTPAD_Y		0x40000000ul	/* buco di L1: fuori da mem_maps nella mappa ricostruita (#130 §1) */
+
+/* M: sorgente MMIO emulata da L0. Il runner verifica col contatore che l'accesso sia EMULATO;
+ * altrimenti l'oracolo classifica INCONCLUSIVE_*. 0xfec00000 = IOAPIC (emulato da bhyve). */
+#define PTPAD_MMIO	0xfec00000ul
+/* Sessione 1b (27/10): una lettura dell'IOAPIC di 8 byte da' SEMPRE 0 (vioapic.c:465), quindi D
+ * azzerata non distingue "copiata" da "non toccata". D parte da una SENTINELLA: dwr = D != sentinella. */
+#define PTPAD_SENT	0x5a5a5a5a5a5a5a5aul
+/* valore della scrittura ordinaria dei casi H: diverso dalla sentinella e da 0 (lettura IOAPIC) */
+#define PTPAD_HVAL	0x4848484848484848ul
+
+/* i casi D restano gli ULTIMI dell'enum: il parser li riconosce con >= PTPAD_D_DATA */
+enum { PTPAD_B, PTPAD_C, PTPAD_A, PTPAD_A_D, PTPAD_H, PTPAD_H_D, PTPAD_HD_DATA, PTPAD_HD_PTP,
+	PTPAD_HD_DATA_PDE, PTPAD_HD_DATA_ALL, PTPAD_HD_PTP_ALL, PTPAD_HD_CONFLICT, PTPAD_HD_CONFLICT_PDE, PTPAD_H_PDE,
+	PTPAD_HM_RAM, PTPAD_HM_PTP,
+	PTPAD_D_DATA, PTPAD_D_PTP, PTPAD_D_DATA_PDE, PTPAD_D_DATA_ALL, PTPAD_D_PTP_ALL, PTPAD_D_CONFLICT,
+	PTPAD_D_CONFLICT_PDE, PTPAD_DM_PTP, PTPAD_NCASI };
+static const char *ptpad_nome[] = { "B", "C", "A", "A_D", "H", "H_D", "HD_DATA", "HD_PTP",
+	"HD_DATA_PDE", "HD_DATA_ALL", "HD_PTP_ALL", "HD_CONFLICT", "HD_CONFLICT_PDE", "H_PDE", "HM_RAM", "HM_PTP",
+	"D_DATA", "D_PTP", "D_DATA_PDE", "D_DATA_ALL", "D_PTP_ALL", "D_CONFLICT", "D_CONFLICT_PDE", "DM_PTP" };
+
+/* ~10 s a 3 GHz: approssimato, serve solo a non restare appesi senza runner */
+#define PTPAD_ATTESA	30000000000ull
+#define PTPAD_COM1	0x3f8
+
+/* un byte dalla COM1 (LSR bit 0 = dato pronto), -1 allo scadere */
+static int ptpad_getc(void)
+{
+	u64 t0 = rdtsc();
+
+	while (rdtsc() - t0 < PTPAD_ATTESA) {
+		if (inb(PTPAD_COM1 + 5) & 1)
+			return inb(PTPAD_COM1);
+		pause();
+	}
+	return -1;
+}
+
+/* Legge "<piano>\n" dall'host e riempie casi[]. 0 = piano valido. Regole (parere #102 §5,
+ * #106 D1): nomi noti, nessun duplicato, B per primo (cancello), al piu' UN caso D e per ultimo. */
+static int ptpad_leggi_piano(int *casi, int *n, char *eco, int eco_sz)
+{
+	char tok[16];
+	int c, l = 0, e = 0, i, k, nd = 0;
+
+	*n = 0;
+	for (;;) {
+		c = ptpad_getc();
+		if (c < 0)
+			return -1;			/* niente runner: nessun caso */
+		if (c == '\r')
+			continue;
+		if (e < eco_sz - 1 && c != '\n')
+			eco[e++] = c;
+		if (c == ',' || c == '\n') {
+			tok[l] = 0;
+			for (k = 0; k < PTPAD_NCASI; k++)
+				if (!strcmp(tok, ptpad_nome[k]))
+					break;
+			if (k >= PTPAD_NCASI || *n >= PTPAD_NCASI)
+				return -2;		/* nome ignoto o troppi */
+			for (i = 0; i < *n; i++)
+				if (casi[i] == k)
+					return -3;	/* duplicato */
+			casi[(*n)++] = k;
+			l = 0;
+			if (c == '\n')
+				break;
+			continue;
+		}
+		if (l >= (int)sizeof(tok) - 1)
+			return -2;
+		tok[l++] = c;
+	}
+	eco[e] = 0;
+	for (i = 0; i < *n; i++)
+		if (casi[i] >= PTPAD_D_DATA) {
+			nd++;
+			if (i != *n - 1)
+				return -4;		/* un caso D non e' l'ultimo */
+		}
+	if (*n == 0 || casi[0] != PTPAD_B || nd > 1)
+		return -5;
+	return 0;
+}
+
+/* indirizzi e modo usati da L2; NON static: li legge l'asm di ptpad_l2 per nome */
+volatile u64 ptpad_src, ptpad_dst;
+volatile int ptpad_done;
+volatile int ptpad_modo;		/* 0 = movsq da M (emulato), 1 = scrittura ordinaria (casi H) */
+void ptpad_l2(void);
+/* parere #111 §5.5: indirizzi delle DUE istruzioni su D, per verificare che il RIP salvato nel VMCS12
+ * dopo una EPT violation sia fermo sull'istruzione (non avanzato) */
+extern char ptpad_l2_movs[], ptpad_l2_store[];
+
+/* L2: INVLPG su D (parere #103 §2: INVEPT NON invalida le traduzioni LINEARI; INVLPG nel
+ * contesto/VPID di L2 forza il re-walk della PTE ordinaria modificata da L1 fra i casi), poi UNA
+ * istruzione su D: un singolo movsq da [ptpad_src] (modo 0, niente REP) o una movq di PTPAD_HVAL
+ * (modo 1, casi H), poi vmcall. Niente stack: L1 riporta GUEST_RIP qui a ogni caso. RAX non e' la
+ * magia di un hypercall KUT (is_hypercall guarda rax>>12): la vmcall resta un'uscita VMX_VMCALL. */
+asm(".pushsection .text\n\t"
+    ".globl ptpad_l2\n"
+    "ptpad_l2:\n\t"
+    "movq ptpad_dst(%rip), %rdi\n\t"
+    "invlpg (%rdi)\n\t"
+    "cmpl $0, ptpad_modo(%rip)\n\t"
+    "jne 1f\n\t"
+    "movq ptpad_src(%rip), %rsi\n"
+    ".globl ptpad_l2_movs\n"
+    "ptpad_l2_movs:\n\t"
+    "movsq\n\t"
+    "jmp 2f\n"
+    "1:\n\t"
+    "movabsq $0x4848484848484848, %rdx\n"	/* PTPAD_HVAL */
+    ".globl ptpad_l2_store\n"
+    "ptpad_l2_store:\n\t"
+    "movq %rdx, (%rdi)\n"
+    "2:\n\t"
+    "movl $1, ptpad_done(%rip)\n\t"
+    "vmcall\n\t"
+    "jmp ptpad_l2\n\t"
+    ".popsection");
+
+/* indirizzo in L1 della PTE foglia di `va` nelle tabelle del guest (cr3) */
+static u64 *ptpad_leaf_pte(u64 cr3, u64 va)
+{
+	unsigned long *pt = (unsigned long *)(cr3 & PT_ADDR_MASK);
+	int l;
+	unsigned off;
+	u64 pte;
+
+	for (l = 4; l >= 1; l--) {
+		off = (va >> (12 + 9 * (l - 1))) & 511;
+		if (l == 1)
+			return (u64 *)&pt[off];
+		pte = pt[off];
+		if (!(pte & PT_PRESENT_MASK) || (pte & PT_PAGE_SIZE_MASK))
+			return NULL;	/* serve una foglia 4K isolata */
+		pt = (unsigned long *)(pte & PT_ADDR_MASK);
+	}
+	return NULL;
+}
+
+/* H2-AD: puntatori alle quattro voci del walk di `va` (PML4E, PDPTE, PDE, PTE); 0 se tutte 4K e presenti */
+static int ptpad_livelli(u64 cr3, u64 va, u64 **e)
+{
+	unsigned long *pt = (unsigned long *)(cr3 & PT_ADDR_MASK);
+	int l;
+
+	for (l = 4; l >= 1; l--) {
+		e[4 - l] = (u64 *)&pt[(va >> (12 + 9 * (l - 1))) & 511];
+		if (l == 1)
+			return 0;
+		if (!(*e[4 - l] & PT_PRESENT_MASK) || (*e[4 - l] & PT_PAGE_SIZE_MASK))
+			return -1;
+		pt = (unsigned long *)(*e[4 - l] & PT_ADDR_MASK);
+	}
+	return -1;
+}
+
+#include "asm/pci.h"	/* pci_config_read* */
+/* H2_MMIO (#131 §2): tutte le BAR del bus 0 e le finestre dei bridge, per escludere che coprano Y */
+static void ptpad_regioni(void)
+{
+	pcidevaddr_t bdf;
+	struct pci_dev dev;
+	int b;
+
+	printf("PTPAD FIXMMIO ioapic=fec00000+1000 hpet=fed00000+400 lapic=fee00000+1000\n");
+	for (bdf = 0; bdf < 256; bdf++) {
+		if (!pci_dev_exists(bdf))
+			continue;
+		pci_dev_init(&dev, bdf);
+		printf("PTPAD PCIDEV bdf=%x id=%x hdr=%x\n", bdf, pci_config_readl(bdf, 0),
+		    pci_config_readb(bdf, 0x0e));
+		if ((pci_config_readb(bdf, 0x0e) & 0x7f) == 1) {	/* bridge: finestre */
+			printf("PTPAD BRIDGE bdf=%x mem=%x pref=%x\n", bdf, pci_config_readl(bdf, 0x20),
+			    pci_config_readl(bdf, 0x24));
+			continue;
+		}
+		for (b = 0; b < PCI_BAR_NUM; b++) {
+			if (!pci_bar_get(&dev, b))
+				continue;
+			printf("PTPAD BAR bdf=%x n=%d mem=%d addr=%lx size=%lx\n", bdf, b,
+			    pci_bar_is_memory(&dev, b), (unsigned long)pci_bar_get_addr(&dev, b),
+			    (unsigned long)pci_bar_size(&dev, b));
+			if (pci_bar_is64(&dev, b))
+				b++;
+		}
+	}
+}
+
+/* Sessione 1 (27/10): KUT mappa l'identita' con pagine GRANDI, quindi la pagina di tabelle di
+ * codice e M e' un PD, non un PT. Raccoglie le pagine di tabelle percorse per `va` (PML4, PDPT,
+ * PD e, se c'e', PT), fermandosi a una voce grande. Ritorna quante. */
+static int ptpad_tabelle(u64 cr3, u64 va, u64 *pag)
+{
+	unsigned long *pt = (unsigned long *)(cr3 & PT_ADDR_MASK);
+	int l, n = 0;
+	u64 pte;
+
+	for (l = 4; l >= 1; l--) {
+		pag[n++] = (u64)pt & ~(PAGE_SIZE - 1);
+		pte = pt[(va >> (12 + 9 * (l - 1))) & 511];
+		if (l == 1 || !(pte & PT_PRESENT_MASK) || (pte & PT_PAGE_SIZE_MASK))
+			break;
+		pt = (unsigned long *)(pte & PT_ADDR_MASK);
+	}
+	return n;
+}
+
+static void vmx_ptpad_fidelity_test(void)
+{
+	u64 cr3, *ptep, pte0, pte1, qual, gpa, va_d, *liv[4], liv0[4], yprime;
+	int sup, k;
+	unsigned long end_of_memory, pageT;
+	void *dpage;
+	int caso, reason, piano[PTPAD_NCASI], np, ip, r;
+	char eco[64];
+
+	if (!is_invept_type_supported(INVEPT_SINGLE) || setup_ept(false)) {
+		report_skip("%s: EPT o INVEPT single assenti", __func__);
+		return;
+	}
+	/* parere #102 §1: NIENTE ept_enable_ad_bits(). I bit A/D ordinari di L2 li aggiorna il
+	 * walker comunque. EPTP12[6] DEVE essere 0 (capacita' non esposta da L0). */
+	TEST_ASSERT(!(eptp & EPTP_AD_FLAG));
+	printf("PTPAD CTX eptp_ad=%d vmcs_eptp_ad=%d cap21=%d cr0=%lx cr3=%lx cr4=%lx efer=%lx\n",
+	    !!(eptp & EPTP_AD_FLAG), !!(vmcs_read(EPTP) & EPTP_AD_FLAG),
+	    !!(ept_vpid.val & (1ull << 21)), read_cr0(), read_cr3(), read_cr4(), rdmsr(MSR_EFER));
+	end_of_memory = fwcfg_get_u64(FW_CFG_RAM_SIZE);
+	if (end_of_memory < (1ul << 32))
+		end_of_memory = (1ul << 32);
+
+	/* Sessione 1 (27/10): l'identita' di KUT e' a pagine GRANDI, la PTE 4K di una pagina di
+	 * alloc_page() non esiste (SKIP osservato). D (fisica dpage, identita' per L1 ed EPT12) viene
+	 * mappata a un indirizzo VIRTUALE proprio, in una regione di 2M allineata e riservata: la
+	 * pagina di tabelle T che ne contiene la PTE 4K e' nuova e mappa SOLO D. */
+	dpage = alloc_page();
+	cr3 = read_cr3();
+	va_d = (u64)alloc_vpages_aligned(512, 9);		/* 2M riservati, allineati a 2M */
+	ptep = install_page((pgd_t *)cr3, virt_to_phys(dpage), (void *)va_d);
+	if (!ptep || ptep != ptpad_leaf_pte(cr3, va_d)) {
+		report_skip("%s: PTE 4K di D non installata/ritrovata", __func__);
+		return;
+	}
+	pageT = (unsigned long)ptep & ~(PAGE_SIZE - 1);	/* pagina T con la PTE di D */
+	if (ptpad_livelli(cr3, va_d, liv) || liv[3] != ptep) {
+		report_skip("%s: walk di D non a quattro livelli 4K", __func__);
+		return;
+	}
+	{
+		/* T deve contenere SOLO la PTE di D */
+		unsigned long *t = (unsigned long *)pageT;
+		int i, presenti = 0;
+
+		for (i = 0; i < 512; i++)
+			presenti += !!(t[i] & PT_PRESENT_MASK);
+		if (presenti != 1) {
+			report_skip("%s: T mappa %d pagine, non solo D", __func__, presenti);
+			return;
+		}
+	}
+	/* parere #103 §6.2: T NON deve coincidere con NESSUNA pagina di tabelle percorsa per il
+	 * codice di L2 o per la sorgente M; altrimenti rimuovere/proteggere T in D_PTP farebbe
+	 * fallire il fetch o la lettura di M, non il walk di D. */
+	{
+		u64 pag[4];
+		int i, n;
+
+		n = ptpad_tabelle(cr3, (u64)ptpad_l2, pag);
+		for (i = 0; i < n; i++)
+			if (pag[i] == pageT)
+				goto non_isolata;
+		n = ptpad_tabelle(cr3, PTPAD_MMIO, pag);
+		for (i = 0; i < n; i++)
+			if (pag[i] == pageT)
+				goto non_isolata;
+		n = ptpad_tabelle(cr3, (u64)ptpad_l2, pag);
+		/* pteaddr: GPA della PTE di D, quello che una violazione su T deve riportare (casi H) */
+		printf("PTPAD MAP va_d=%lx d=%lx T=%lx pte=%lx livelli_codice=%d pdeaddr=%lx pteaddr=%lx\n",
+		    va_d, virt_to_phys(dpage), pageT, *ptep, n, virt_to_phys(liv[2]), virt_to_phys(ptep));
+		goto isolata;
+non_isolata:
+		report_skip("%s: T coincide con una tabella di codice/M", __func__);
+		return;
+isolata:
+		;
+	}
+	/* H2_MMIO (#131): Y' = una pagina RAM dell'L1 per HM_RAM; regioni MMIO/PCI una volta per sessione */
+	yprime = virt_to_phys(alloc_page());
+	printf("PTPAD MEM ram=%lx y=%lx yp=%lx\n", (unsigned long)fwcfg_get_u64(FW_CFG_RAM_SIZE), PTPAD_Y, yprime);
+	ptpad_regioni();
+	/* parere #106 D1: il piano lo da' l'host; senza runner non si esegue NESSUN caso */
+	printf("PTPAD WAIT piano\n");
+	r = ptpad_leggi_piano(piano, &np, eco, sizeof(eco));
+	if (r == -1) {
+		report_skip("%s: nessun piano dall'host (runner assente): nessun caso eseguito", __func__);
+		return;
+	}
+	if (r < 0) {
+		printf("PTPAD PLAN rifiutato err=%d\n", r);
+		report(false, "%s: piano non valido (err %d): nessun caso eseguito", __func__, r);
+		return;
+	}
+	printf("PTPAD PLAN cases=%s\n", eco);
+
+	ptpad_src = PTPAD_MMIO;
+	ptpad_dst = va_d;
+	test_set_guest(ptpad_l2);
+
+	for (ip = 0; ip < np; ip++) {
+		caso = piano[ip];
+		printf("PTPAD CASE %s\n", ptpad_nome[caso]);
+		/* parere #106 D2: fermo finche' l'host non ha fotografato il contatore */
+		if (ptpad_getc() != 'g') {
+			printf("PTPAD NOACK %s\n", ptpad_nome[caso]);
+			report(false, "%s: nessun ACK dall'host al caso %s: interrotto", __func__,
+			    ptpad_nome[caso]);
+			return;
+		}
+
+		/* EPT12: riparti da identita' R+W+X su tutto, poi applica il caso */
+		install_ept(pml4, pageT, pageT, EPT_PRESENT);
+		install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, EPT_PRESENT);
+		install_ept(pml4, PTPAD_MMIO, PTPAD_MMIO, EPT_RA);	/* MMIO sola lettura: sorgente */
+		/* G1: la pagina della PD di D (resa R-only da _CONFLICT_PDE) torna RWX a ogni caso */
+		install_ept(pml4, (u64)liv[2] & ~(PAGE_SIZE - 1), (u64)liv[2] & ~(PAGE_SIZE - 1), EPT_PRESENT);
+
+		/* PTE di D e permessi di T e D secondo il caso */
+		pte0 = *ptep;
+		switch (caso) {
+		case PTPAD_B:		/* controllo +: T RW, A/D=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_PRESENT);	/* RW */
+			break;
+		case PTPAD_C:		/* controllo -: T R-only, A/D gia' 1 */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			install_ept(pml4, pageT, pageT, EPT_RA);	/* R, no W */
+			break;
+		case PTPAD_A:		/* H1: T R-only, A=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_A_D:		/* H1 su PG_M: A=1, D=0 */
+			*ptep = (pte0 | PT_ACCESSED_MASK) & ~PT_DIRTY_MASK;
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_H:		/* controllo di A: stessa T R-only, A=0, scrittura HARDWARE */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_H_D:		/* controllo di A_D: A=1, D=0, scrittura HARDWARE */
+			*ptep = (pte0 | PT_ACCESSED_MASK) & ~PT_DIRTY_MASK;
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			break;
+		case PTPAD_HD_DATA:	/* controllo hardware di D_DATA: stessa EPT12, scrittura ordinaria */
+		case PTPAD_D_DATA:	/* H2: D non mappata in EPT12 */
+		case PTPAD_HD_DATA_PDE: case PTPAD_D_DATA_PDE:	/* H2-AD: + PDE con A=0 */
+		case PTPAD_HD_DATA_ALL: case PTPAD_D_DATA_ALL:	/* H2-AD: + PML4E, PDPTE, PDE con A=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_PRESENT);	/* T ok */
+			install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, 0); /* D assente */
+			break;
+		case PTPAD_HD_PTP:	/* controllo hardware di D_PTP */
+		case PTPAD_D_PTP:	/* H2: T non mappata -> il walk LEGGE la PTE: violazione di LETTURA su T */
+		case PTPAD_HD_PTP_ALL: case PTPAD_D_PTP_ALL:	/* H2-AD: + PML4E, PDPTE, PDE con A=0 */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, 0);		/* T assente */
+			break;
+		case PTPAD_HD_CONFLICT: case PTPAD_D_CONFLICT:	/* G1: T senza W + A=D=0 + D assente */
+			*ptep = pte0 & ~(PT_ACCESSED_MASK | PT_DIRTY_MASK);
+			install_ept(pml4, pageT, pageT, EPT_RA);
+			install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, 0);
+			break;
+		case PTPAD_HD_CONFLICT_PDE: case PTPAD_D_CONFLICT_PDE:	/* G1: PD senza W + PDE A=0 + D assente */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			install_ept(pml4, (u64)liv[2] & ~(PAGE_SIZE - 1), (u64)liv[2] & ~(PAGE_SIZE - 1), EPT_RA);
+			install_ept(pml4, (unsigned long)dpage, (unsigned long)dpage, 0);
+			break;
+		case PTPAD_H_PDE:	/* G1b: controllo positivo di _CONFLICT_PDE: PD senza W + PDE A=0, D PRESENTE */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			install_ept(pml4, (u64)liv[2] & ~(PAGE_SIZE - 1), (u64)liv[2] & ~(PAGE_SIZE - 1), EPT_RA);
+			break;
+		case PTPAD_HM_RAM:	/* #131: controllo positivo, T -> Y' (RAM con la copia di T) */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			memcpy((void *)yprime, (void *)pageT, PAGE_SIZE);
+			install_ept(pml4, yprime, pageT, EPT_PRESENT);
+			break;
+		case PTPAD_HM_PTP: case PTPAD_DM_PTP:	/* #131: T -> Y, buco di L1, EPT12 CONCEDE (RWX) */
+			*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;
+			install_ept(pml4, PTPAD_Y, pageT, EPT_PRESENT);
+			break;
+		}
+		/* H2-AD: A=0 nei livelli superiori del walk di D (le voci tornano con A=1 a fine caso) */
+		sup = (caso == PTPAD_HD_DATA_PDE || caso == PTPAD_D_DATA_PDE || caso == PTPAD_HD_CONFLICT_PDE ||
+		    caso == PTPAD_D_CONFLICT_PDE || caso == PTPAD_H_PDE) ? 1 :
+		    (caso == PTPAD_HD_DATA_ALL || caso == PTPAD_D_DATA_ALL || caso == PTPAD_HD_PTP_ALL ||
+		    caso == PTPAD_D_PTP_ALL) ? 3 : 0;
+		for (k = 3 - sup; k < 3; k++)
+			*liv[k] &= ~PT_ACCESSED_MASK;
+		pte0 = *ptep;
+		*(volatile u64 *)dpage = PTPAD_SENT;	/* D = sentinella: dwr osservabile */
+		invept(INVEPT_SINGLE, eptp);
+		ptpad_done = 0;
+		ptpad_modo = (caso == PTPAD_H || caso == PTPAD_H_D || caso == PTPAD_HD_DATA ||
+		    caso == PTPAD_HD_PTP || caso == PTPAD_HD_DATA_PDE || caso == PTPAD_HD_DATA_ALL ||
+		    caso == PTPAD_HD_PTP_ALL || caso == PTPAD_HD_CONFLICT || caso == PTPAD_HD_CONFLICT_PDE ||
+		    caso == PTPAD_H_PDE || caso == PTPAD_HM_RAM || caso == PTPAD_HM_PTP);
+		/* ogni caso riparte dall'inizio di L2 (invlpg compreso), anche dopo una violazione */
+		vmcs_write(GUEST_RIP, (u64)ptpad_l2);
+
+		/* il runner fotografa il contatore host QUI, alla riga CASE, e dopo enter_guest */
+		{	/* G1b: le voci foglia di EPT12 di T, della PD e di D, subito prima (~0 = non trovata) */
+			unsigned long et = ~0ul, epd = ~0ul, ed = ~0ul;
+
+			get_ept_pte(pml4, pageT, 1, &et);
+			get_ept_pte(pml4, (u64)liv[2] & ~(PAGE_SIZE - 1), 1, &epd);
+			get_ept_pte(pml4, (unsigned long)dpage, 1, &ed);
+			printf("PTPAD EPT t=%lx pd=%lx d=%lx\n", et, epd, ed);
+		}
+		for (k = 0; k < 4; k++)		/* H2-AD: fotografia dei livelli IMMEDIATAMENTE prima */
+			liv0[k] = *(volatile u64 *)liv[k];
+		enter_guest();
+		reason = vmcs_read(EXI_REASON) & 0xff;
+		printf("PTPAD LIV pml4=%lx>%lx pdpt=%lx>%lx pde=%lx>%lx pte=%lx>%lx\n",
+		    liv0[0], *(volatile u64 *)liv[0], liv0[1], *(volatile u64 *)liv[1],
+		    liv0[2], *(volatile u64 *)liv[2], liv0[3], *(volatile u64 *)liv[3]);
+		printf("PTPAD DVAL %s d=%lx sent=%lx\n", ptpad_nome[caso],
+		    *(volatile u64 *)dpage, PTPAD_SENT);
+		if (reason == VMX_EPT_VIOLATION) {
+			qual = vmcs_read(EXI_QUALIFICATION);
+			gpa = vmcs_read(INFO_PHYS_ADDR);
+			pte1 = *ptep;
+			/* parere #111 §5.5: GLA e RIP dal VMCS12, riga a parte (formato della riga L1
+			 * invariato rispetto alla sessione 1d) */
+			printf("PTPAD XINFO gla=%lx rip=%lx rip_atteso=%lx va_d=%lx\n",
+			    vmcs_read(GUEST_LINEAR_ADDRESS), vmcs_read(GUEST_RIP),
+			    ptpad_modo ? (u64)ptpad_l2_store : (u64)ptpad_l2_movs, va_d);
+			printf("PTPAD L1 viol=1 reason=%d qual=%lx gpa=%lx paddr=%d pte0=%lx pte1=%lx dwr=%d ripadv=0\n",
+			    reason, qual, gpa, !!(qual & EPT_VLT_PADDR), pte0, pte1,
+			    *(volatile u64 *)dpage != PTPAD_SENT);
+			/* non si rientra nell'istruzione: si passa al caso dopo */
+		} else if (reason == VMX_VMCALL) {
+			pte1 = *ptep;
+			printf("PTPAD L1 viol=0 reason=%d qual=0 gpa=0 paddr=0 pte0=%lx pte1=%lx dwr=%d ripadv=%d\n",
+			    reason, pte0, pte1, *(volatile u64 *)dpage != PTPAD_SENT, ptpad_done);
+			skip_exit_vmcall();
+		} else {
+			printf("PTPAD L1 viol=0 reason=%d qual=0 gpa=0 paddr=0 pte0=%lx pte1=%lx dwr=0 ripadv=0\n",
+			    reason, pte0, *ptep);
+		}
+		*ptep = pte0 | PT_ACCESSED_MASK | PT_DIRTY_MASK;	/* ripulisci per il caso dopo */
+		for (k = 0; k < 3; k++)
+			*liv[k] |= PT_ACCESSED_MASK;			/* H2-AD: livelli superiori come prima */
+	}
+	/* L2 e' un anello senza fine: senza questo il framework segnala "Guest didn't run to
+	 * completion" (sessione 1c, QEMU rc=3) */
+	test_set_guest_finished();
+	report(true, "%s: tutti i casi eseguiti (verdetto OFFLINE con ptpad_an.py)", __func__);
+}
+
+/* Registrazione: aggiungere nella tabella vmx_tests[]:
+ *     TEST(vmx_ptpad_fidelity_test),
+ */
