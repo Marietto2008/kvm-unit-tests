@@ -31,6 +31,8 @@ tests = $(TEST_DIR)/apic.$(exe) \
 	  $(TEST_DIR)/ioapic.$(exe) $(TEST_DIR)/memory.$(exe) \
 	  $(TEST_DIR)/pku.$(exe) $(TEST_DIR)/hyperv_clock.$(exe)
 tests += $(TEST_DIR)/syscall.$(exe)
+tests += $(TEST_DIR)/u64.$(exe)
+tests += $(TEST_DIR)/p3_contesa.$(exe)	# Claude 01/11/2026: provocazione di P3 (stadio 11)
 tests += $(TEST_DIR)/tscdeadline_latency.$(exe)
 tests += $(TEST_DIR)/intel-iommu.$(exe)
 tests += $(TEST_DIR)/vmware_backdoors.$(exe)

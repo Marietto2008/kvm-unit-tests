@@ -1,0 +1,232 @@
+/*
+ * u64.c -- Claude 31/10/2026, pareri #164-#166 (livello A1 del dossier di protocollo). Accessi DATI ordinari,
+ * eseguiti dalla CPU, che attraversano 2^64 in un guest a 64 bit: nessuna istruzione VMX, nessun nesting.
+ *
+ * Mappe: la pagina virtuale 0xfffffffffffff000 -> pagina fisica R1, la pagina virtuale 0 -> pagina fisica R2 (RAM
+ * del guest, distinte). Le sentinelle si scrivono e si leggono tramite l'alias d'identita' di R1/R2 (phys_to_virt),
+ * MAI tramite gli indirizzi sotto prova: un controllo non fa un secondo fault ambiguo.
+ *
+ * Ogni caso e' UNA istruzione (mov a 8 byte, movdqu a 16 byte), dentro ASM_TRY con la sua etichetta di recupero: un
+ * fault su un'altra istruzione non e' gestito (il test si ferma). CR0.WP=1 (registrato) per la variante di sola
+ * lettura; invlpg su entrambe le pagine dopo ogni cambio di PTE; CR2 azzerato a un valore sentinella prima di ogni
+ * accesso.
+ *
+ * Il MODELLO messo alla prova (quello del banco offline, KVM): indirizzo lineare modulo 2^64, byte contigui, #PF con
+ * CR2 = il primo byte non accessibile (la pagina zero -> CR2 = 0), nessun byte scritto se l'accesso fa fault. Un esito
+ * diverso (es. #GP) e' CONTRARIO AL MODELLO e si registra: non si scarta.
+ *
+ * Righe d'uscita (per l'analisi offline): "U64 CASO ...", "U64 FINE ...". Nessuna lettura dall'host.
+ */
+#include "libcflat.h"
+#include "processor.h"
+#include "desc.h"
+#include "vm.h"
+#include "alloc_page.h"
+
+#define VA_ALTA		((u8 *)0xfffffffffffff000ULL)	/* ultima pagina virtuale */
+#define VA_ZERO		((u8 *)0x0ULL)			/* pagina zero */
+#define CR2_SENT	0x5a5a5a5a5a5a5a5aULL
+#define PTE_P		0x1ULL
+#define PTE_W		0x2ULL
+#define COM1		0x3f8
+#define ATTESA_VIA	(60ULL * 1000 * 1000 * 1000)	/* cicli di TSC per il 'g' del driver */
+
+enum { V_OK, V_R2_ASSENTE, V_R1_ASSENTE, V_R2_SOLA_LETTURA, NV };
+static const char *vnome[NV] = { "ok", "R2_assente", "R1_assente", "R2_sola_lettura" };
+
+struct accesso { const char *nome; u64 off; int len; int scrive; };
+static const struct accesso acc[] = {
+	{ "mov_r8",     0xff8, 8, 0 },		/* 0xfffffffffffffff8: 8 byte, NESSUN rollover */
+	{ "movdqu_r16", 0xff8, 16, 0 },		/* 8 alti + 8 da zero */
+	{ "mov_r8",     0xffc, 8, 0 },		/* 4 + 4 */
+	{ "mov_r8",     0xfff, 8, 0 },		/* 1 + 7 */
+	{ "mov_w8",     0xff8, 8, 1 },
+	{ "movdqu_w16", 0xff8, 16, 1 },
+	{ "mov_w8",     0xffc, 8, 1 },
+	{ "mov_w8",     0xfff, 8, 1 },
+};
+
+/* un byte dalla COM1, -1 allo scadere: il driver fotografa i contatori d'uscita della VM e poi manda 'g' */
+static int
+com1_getc(void)
+{
+	u64 t0 = rdtsc();
+
+	while (rdtsc() - t0 < ATTESA_VIA) {
+		if (inb(COM1 + 5) & 1)
+			return (inb(COM1));
+		pause();
+	}
+	return (-1);
+}
+
+static u8 *r1, *r2;			/* alias d'identita' delle due pagine fisiche */
+static pteval_t *pte1, *pte2;
+static pteval_t pte1_orig, pte2_orig;
+static u8 val[16], dato[16];
+
+static void
+riempi(void)
+{
+	int i;
+
+	for (i = 0; i < PAGE_SIZE; i++) {
+		r1[i] = (u8)(0xa0 ^ i);
+		r2[i] = (u8)(0x50 ^ (i * 3));
+	}
+}
+
+/* il byte i dell'operando, nel modello U64 */
+static u8 *
+modello_byte(u64 off, int i, u8 *alt1, u8 *alt2)
+{
+	u64 o = off + i;
+
+	return (o < PAGE_SIZE ? &alt1[o] : &alt2[o - PAGE_SIZE]);
+}
+
+static void
+mappe(int var)
+{
+	*pte1 = (virt_to_phys(r1) & PT_ADDR_MASK) | PTE_P | PTE_W;
+	*pte2 = (virt_to_phys(r2) & PT_ADDR_MASK) | PTE_P | PTE_W;
+	if (var == V_R1_ASSENTE)
+		*pte1 &= ~PTE_P;
+	if (var == V_R2_ASSENTE)
+		*pte2 &= ~PTE_P;
+	if (var == V_R2_SOLA_LETTURA)
+		*pte2 &= ~PTE_W;
+	invlpg(VA_ALTA);
+	invlpg(VA_ZERO);
+}
+
+/* UNA istruzione per caso; ritorna il vettore (0 = nessuna eccezione) */
+static unsigned
+esegui(const struct accesso *a, u64 *err)
+{
+	u8 *p = VA_ALTA + a->off;
+
+	write_cr2(CR2_SENT);
+	if (a->len == 8 && !a->scrive)
+		asm volatile(ASM_TRY("1f") "mov (%[p]), %%rcx\n\t" "mov %%rcx, (%[v])\n\t" "1:"
+		    : : [p] "r"(p), [v] "r"(val) : "rcx", "memory");
+	else if (a->len == 8)
+		asm volatile("mov (%[d]), %%rcx\n\t" ASM_TRY("1f") "mov %%rcx, (%[p])\n\t" "1:"
+		    : : [p] "r"(p), [d] "r"(dato) : "rcx", "memory");
+	else if (!a->scrive)		/* movdqu (%rax),%xmm0 ; movdqu %xmm0,(%rbx): codifiche fissate */
+		asm volatile(ASM_TRY("1f") ".byte 0xf3, 0x0f, 0x6f, 0x00\n\t" ".byte 0xf3, 0x0f, 0x7f, 0x03\n\t" "1:"
+		    : : "a"(p), "b"(val) : "memory");
+	else				/* movdqu (%rbx),%xmm0 ; movdqu %xmm0,(%rax) */
+		asm volatile(".byte 0xf3, 0x0f, 0x6f, 0x03\n\t" ASM_TRY("1f") ".byte 0xf3, 0x0f, 0x7f, 0x00\n\t" "1:"
+		    : : "a"(p), "b"(dato) : "memory");
+	*err = exception_error_code();
+	return (exception_vector());
+}
+
+int
+main(void)
+{
+	static u8 alt1[PAGE_SIZE], alt2[PAGE_SIZE];
+	pgd_t *cr3;
+	int i, k, v, n = 0, nmod = 0, ncontr = 0;
+
+	setup_vm();
+	cr3 = (pgd_t *)read_cr3();
+	write_cr0((read_cr0() | X86_CR0_WP | X86_CR0_MP) & ~X86_CR0_EM);
+	write_cr4(read_cr4() | X86_CR4_OSFXSR);
+	printf("U64 INIZIO cr0=%lx cr4=%lx (WP=%d OSFXSR=%d)\n", read_cr0(), read_cr4(),
+	    !!(read_cr0() & X86_CR0_WP), !!(read_cr4() & X86_CR4_OSFXSR));
+
+	r1 = alloc_page();
+	r2 = alloc_page();
+	memset(r1, 0, PAGE_SIZE);
+	memset(r2, 0, PAGE_SIZE);
+	/* le pagine virtuali sotto prova: si prendono le PTE (create se mancano) e se ne conserva l'originale */
+	pte1 = install_pte(cr3, 1, VA_ALTA, (virt_to_phys(r1) & PT_ADDR_MASK) | PTE_P | PTE_W, NULL);
+	pte2 = get_pte(cr3, VA_ZERO);
+	pte2_orig = pte2 ? *pte2 : 0;
+	pte1_orig = 0;
+	pte2 = install_pte(cr3, 1, VA_ZERO, (virt_to_phys(r2) & PT_ADDR_MASK) | PTE_P | PTE_W, NULL);
+	printf("U64 MAPPE va_alta->%lx va_zero->%lx pte_zero_prima=%lx\n", (unsigned long)virt_to_phys(r1),
+	    (unsigned long)virt_to_phys(r2), (unsigned long)pte2_orig);
+	if (virt_to_phys(r1) == virt_to_phys(r2)) {
+		printf("U64 ERRORE pagine fisiche coincidenti\n");
+		return (1);
+	}
+	/* riscaldamento: le traduzioni e il backing di L0 si popolano FUORI dalla finestra di misura */
+	mappe(V_OK);
+	(void)*(volatile u8 *)VA_ALTA;
+	(void)*(volatile u8 *)VA_ZERO;
+	printf("U64 RISCALDAMENTO fatto\n");
+	/* la finestra di misura: il driver fotografa i contatori (instruction emulation, nested page fault) prima del
+	 * 'g' e dopo "U64 FINE"; nella finestra devono restare fermi, altrimenti la misura non e' nativa */
+	printf("U64 PRONTO: 'g' sulla COM1 per aprire la finestra di misura\n");
+	if (com1_getc() != 'g') {
+		printf("U64 NESSUN VIA: nessun caso eseguito\n");
+		report(false, "u64: nessun via dal driver");
+		return (report_summary());
+	}
+	printf("U64 FINESTRA APERTA\n");
+
+	for (i = 0; i < 16; i++)
+		dato[i] = (u8)(0xc0 + i);
+	for (k = 0; k < (int)ARRAY_SIZE(acc); k++)
+		for (v = 0; v < NV; v++) {
+			const struct accesso *a = &acc[k];
+			bool tocca_zero = a->off + a->len > PAGE_SIZE;
+			unsigned vec, vec_att = 0;
+			u64 err = 0, cr2, err_att = 0, cr2_att = 0;
+			bool mem_ok = true, val_ok = true;
+			const char *cl;
+
+			if (v == V_R2_SOLA_LETTURA && !a->scrive)
+				continue;
+			riempi();
+			memcpy(alt1, r1, PAGE_SIZE);
+			memcpy(alt2, r2, PAGE_SIZE);
+			memset(val, 0xee, sizeof(val));
+			mappe(v);
+			vec = esegui(a, &err);
+			cr2 = read_cr2();
+			mappe(V_OK);
+
+			/* il modello */
+			if (v == V_R1_ASSENTE) {
+				vec_att = 14; err_att = a->scrive ? 2 : 0; cr2_att = (u64)(VA_ALTA + a->off);
+			} else if (v == V_R2_ASSENTE && tocca_zero) {
+				vec_att = 14; err_att = a->scrive ? 2 : 0; cr2_att = 0;
+			} else if (v == V_R2_SOLA_LETTURA && tocca_zero) {
+				vec_att = 14; err_att = 3; cr2_att = 0;
+			}
+			if (vec_att == 0 && a->scrive)		/* nel modello i byte scritti sono quelli dell'operando */
+				for (i = 0; i < a->len; i++)
+					*modello_byte(a->off, i, alt1, alt2) = dato[i];
+			if (vec_att == 0 && !a->scrive)
+				for (i = 0; i < a->len; i++)
+					val_ok = val_ok && val[i] == *modello_byte(a->off, i, alt1, alt2);
+			mem_ok = !memcmp(r1, alt1, PAGE_SIZE) && !memcmp(r2, alt2, PAGE_SIZE);
+			if (vec == vec_att && (vec != 14 || (err == err_att && cr2 == cr2_att)) && val_ok && mem_ok) {
+				cl = "MODELLO";
+				nmod++;
+			} else {
+				cl = "CONTRARIO_AL_MODELLO";
+				ncontr++;
+			}
+			n++;
+			printf("U64 CASO %d %s va=%lx len=%d var=%s vec=%u err=%lx cr2=%lx val=", n, a->nome,
+			    (unsigned long)(VA_ALTA + a->off), a->len, vnome[v], vec, (unsigned long)err,
+			    vec == 14 ? (unsigned long)cr2 : 0UL);
+			for (i = 0; i < a->len && !a->scrive; i++)
+				printf("%02x", val[i]);
+			printf(" memoria=%s atteso(vec=%u err=%lx cr2=%lx) -> %s\n", mem_ok ? "come_modello" : "DIVERSA",
+			    vec_att, (unsigned long)err_att, (unsigned long)cr2_att, cl);
+		}
+	/* le mappe di prima */
+	*pte2 = pte2_orig;
+	*pte1 = pte1_orig;
+	invlpg(VA_ALTA);
+	invlpg(VA_ZERO);
+	printf("U64 FINE casi=%d modello=%d contrari=%d\n", n, nmod, ncontr);
+	report(ncontr == 0, "u64: %d casi, %d come il modello, %d contrari (un contrario e' un DATO)", n, nmod, ncontr);
+	return (report_summary());
+}
