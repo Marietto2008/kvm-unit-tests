@@ -14138,6 +14138,7 @@ static u64 lf_cr3;
 static u32 lf_next_rax, lf_exits, lf_bad_qual, lf_bad_rip, lf_bad_cr3, lf_bad_len, lf_bad_bytes, lf_bad_rax;
 static u32 lf_walk_fail, lf_nx_seen;
 static u64 lf_first_bad_rip, lf_first_bad_cr3;
+static int lf_ept;	/* 1 = variante EPT-MMIO (pagina senza permessi nell'EPT, come il LAPIC dell'L2 in Hyper-V) */
 static const u8 lf_insn_bytes[6] = { 0x89, 0x81, 0x80, 0x03, 0x00, 0x00 };
 extern char lf_insn[];
 
@@ -14177,11 +14178,64 @@ static int lapic_fetch_init(struct vmcs *vmcs)
 	vmcs_write(CPU_EXEC_CTRL0, vmcs_read(CPU_EXEC_CTRL0) | CPU_SECONDARY);
 	vmcs_write(CPU_EXEC_CTRL1, vmcs_read(CPU_EXEC_CTRL1) | CPU_VIRT_APIC_ACCESSES);
 	lf_cr3 = vmcs_read(GUEST_CR3);
+	lf_ept = 0;
 	lf_next_rax = 1;
 	lf_exits = lf_bad_qual = lf_bad_rip = lf_bad_cr3 = lf_bad_len = lf_bad_bytes = lf_bad_rax = 0;
 	lf_walk_fail = lf_nx_seen = 0;
 	lf_first_bad_rip = lf_first_bad_cr3 = 0;
 	return VMX_TEST_START;
+}
+
+/*
+ * Variante EPT-MMIO (parere Opus 003 §5 percorso 2): il nostro L0 NON offre all'L1 "virtualize APIC accesses"
+ * (apic_reg_virt_test e lapic_fetch saltati, 04/11 12:35), quindi Hyper-V intercetta il LAPIC dell'L2 lasciando la
+ * pagina senza permessi nell'EPT: ogni scrittura e' una EPT violation riflessa. Qui la pagina sonda ha permessi 0
+ * nell'EPT dell'L1 di prova; l'L1 controlla qualificazione (scrittura, GLA valido, traduzione), GPA e GLA della
+ * violation, poi gli stessi RIP/CR3/RAX/byte della variante APIC-access. La lunghezza d'uscita non e' definita per
+ * una EPT violation: non si controlla, il RIP avanza della lunghezza decodificata.
+ */
+static int lapic_fetch_ept_init(struct vmcs *vmcs)
+{
+	int r = ept_init_common(false);
+
+	if (r != VMX_TEST_START)
+		return r;
+	lf_apic_page = alloc_page();
+	install_ept(pml4, (unsigned long)lf_apic_page, (unsigned long)lf_apic_page, 0);
+	invept(INVEPT_SINGLE, eptp);
+	lf_cr3 = vmcs_read(GUEST_CR3);
+	lf_ept = 1;
+	lf_next_rax = 1;
+	lf_exits = lf_bad_qual = lf_bad_rip = lf_bad_cr3 = lf_bad_len = lf_bad_bytes = lf_bad_rax = 0;
+	lf_walk_fail = lf_nx_seen = 0;
+	lf_first_bad_rip = lf_first_bad_cr3 = 0;
+	return VMX_TEST_START;
+}
+
+/* controlli comuni alle due varianti, a ogni uscita sulla scrittura sonda */
+static void lf_check(u64 rip, u64 cr3, struct guest_regs *regs)
+{
+	u8 b[6];
+	int nx;
+
+	lf_exits++;
+	if (rip != (u64)lf_insn) {
+		if (!lf_bad_rip++)
+			lf_first_bad_rip = rip;
+	}
+	if (cr3 != lf_cr3) {
+		if (!lf_bad_cr3++)
+			lf_first_bad_cr3 = cr3;
+	}
+	if (!lf_walk_read(cr3, rip, b, 6, &nx))
+		lf_walk_fail++;
+	else if (memcmp(b, lf_insn_bytes, 6))
+		lf_bad_bytes++;
+	if (nx)
+		lf_nx_seen++;
+	if ((u32)regs->rax != lf_next_rax)
+		lf_bad_rax++;
+	lf_next_rax = (u32)regs->rax + 1;
 }
 
 static void lapic_fetch_main(void)
@@ -14205,33 +14259,23 @@ static int lapic_fetch_exit(union exit_reason exit_reason)
 	u64 qual = vmcs_read(EXI_QUALIFICATION);
 	u64 rip = vmcs_read(GUEST_RIP);
 	u64 cr3 = vmcs_read(GUEST_CR3);
-	u8 b[6];
-	int nx;
-
 	switch (exit_reason.basic) {
 	case VMX_APIC_ACCESS:
-		lf_exits++;
 		if ((qual & 0xfff) != 0x380 || ((qual >> 12) & 0xf) != 1)
 			lf_bad_qual++;
-		if (rip != (u64)lf_insn) {
-			if (!lf_bad_rip++)
-				lf_first_bad_rip = rip;
-		}
-		if (cr3 != lf_cr3) {
-			if (!lf_bad_cr3++)
-				lf_first_bad_cr3 = cr3;
-		}
 		if (vmcs_read(EXI_INST_LEN) != 6)
 			lf_bad_len++;
-		if (!lf_walk_read(cr3, rip, b, 6, &nx))
-			lf_walk_fail++;
-		else if (memcmp(b, lf_insn_bytes, 6))
-			lf_bad_bytes++;
-		if (nx)
-			lf_nx_seen++;
-		if ((u32)regs->rax != lf_next_rax)
-			lf_bad_rax++;
-		lf_next_rax = (u32)regs->rax + 1;
+		lf_check(rip, cr3, regs);
+		vmcs_write(GUEST_RIP, rip + sizeof(lf_insn_bytes));
+		return VMX_TEST_RESUME;
+	case VMX_EPT_VIOLATION:
+		if (!lf_ept)
+			break;
+		if (!(qual & EPT_VLT_WR) || !(qual & EPT_VLT_LADDR_VLD) || !(qual & EPT_VLT_PADDR) ||
+		    vmcs_read(INFO_PHYS_ADDR) != virt_to_phys(lf_apic_page) + 0x380 ||
+		    vmcs_read(GUEST_LINEAR_ADDRESS) != (u64)lf_apic_page + 0x380)
+			lf_bad_qual++;
+		lf_check(rip, cr3, regs);
 		vmcs_write(GUEST_RIP, rip + sizeof(lf_insn_bytes));
 		return VMX_TEST_RESUME;
 	case VMX_VMCALL:
@@ -14248,9 +14292,10 @@ static int lapic_fetch_exit(union exit_reason exit_reason)
 		vmcs_write(GUEST_RIP, rip + vmcs_read(EXI_INST_LEN));
 		return VMX_TEST_RESUME;
 	default:
-		report_fail("lapic_fetch: uscita inattesa %d, qual %#lx, rip %#lx", exit_reason.basic, qual, rip);
-		return VMX_TEST_VMEXIT;
+		break;
 	}
+	report_fail("lapic_fetch: uscita inattesa %d, qual %#lx, rip %#lx", exit_reason.basic, qual, rip);
+	return VMX_TEST_VMEXIT;
 }
 
 struct vmx_test vmx_tests[] = {
@@ -14271,6 +14316,7 @@ struct vmx_test vmx_tests[] = {
 	{ "EPT A/D disabled", ept_init, ept_main, ept_exit_handler },
 	{ "ept12_remap", ept12_remap_init, ept12_remap_main, ept12_remap_exit },
 	{ "lapic_fetch", lapic_fetch_init, lapic_fetch_main, lapic_fetch_exit },
+	{ "lapic_fetch_ept", lapic_fetch_ept_init, lapic_fetch_main, lapic_fetch_exit },
 	{ "ept12_remap_g", ept12_remap_g_init, ept12_remap_main, ept12_remap_exit },
 	{ "ept12_remap_cold", ept12_remap_cold_init, ept12_remap_main, ept12_remap_exit },
 	{ "ept12_remap_invlpg", ept12_remap_invlpg_init, ept12_remap_main, ept12_remap_exit },
