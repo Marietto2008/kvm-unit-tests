@@ -14123,6 +14123,136 @@ static void vmx_cet_test(void)
 #define TEST(name) { #name, .v2 = name }
 
 /* name/init/guest_main/exit_handler/vmfail_handler */
+/*
+ * lapic_fetch -- Claude 04/11/2026 (WSL2-FreeBSD 003, parere Opus §5 percorso 1). Riproduce il caso del panic del
+ * guest FreeBSD in WSL2: l'L2 scrive l'Initial Count del LAPIC con ESATTAMENTE `mov %eax,0x380(%rcx)` (89 81 80 03
+ * 00 00) su una pagina APIC-access; a ogni uscita l'L1 di prova fa cio' che deve poter fare Hyper-V e lo confronta con
+ * valori noti in anticipo: motivo, qualificazione (offset 0x380, scrittura lineare), RIP = indirizzo dell'istruzione,
+ * CR3 dell'L2 invariato, lunghezza 6, RAX = valore atteso, e i 6 byte RILETTI con un walk proprio e non mutante delle
+ * tabelle dell'L2 (dal CR3 del VMCS12). Il RIP avanza della lunghezza DECODIFICATA. Nessun EPT, nessun interrupt
+ * (fase 1).
+ */
+#define LF_ITER		100000
+static void *lf_apic_page;
+static u64 lf_cr3;
+static u32 lf_next_rax, lf_exits, lf_bad_qual, lf_bad_rip, lf_bad_cr3, lf_bad_len, lf_bad_bytes, lf_bad_rax;
+static u32 lf_walk_fail, lf_nx_seen;
+static u64 lf_first_bad_rip, lf_first_bad_cr3;
+static const u8 lf_insn_bytes[6] = { 0x89, 0x81, 0x80, 0x03, 0x00, 0x00 };
+extern char lf_insn[];
+
+/* walk a 4 livelli, solo letture; *nx = 1 se un livello ha XD. 0 = pagina non presente */
+static int lf_walk_read(u64 cr3, u64 va, u8 *out, int n, int *nx)
+{
+	u64 *t = (u64 *)(cr3 & PT_ADDR_MASK);
+	int level;
+
+	*nx = 0;
+	for (level = 4; level >= 1; level--) {
+		u64 e = t[(va >> (12 + 9 * (level - 1))) & 511];
+		u64 pg = 1ull << (12 + 9 * (level - 1));
+
+		if (!(e & PT_PRESENT_MASK))
+			return 0;
+		if (e & PT64_NX_MASK)
+			*nx = 1;
+		if (level == 1 || (e & PT_PAGE_SIZE_MASK)) {
+			memcpy(out, (void *)((e & PT_ADDR_MASK & ~(pg - 1)) | (va & (pg - 1))), n);
+			return 1;
+		}
+		t = (u64 *)(e & PT_ADDR_MASK);
+	}
+	return 0;
+}
+
+static int lapic_fetch_init(struct vmcs *vmcs)
+{
+	if (!(ctrl_cpu_rev[0].clr & CPU_SECONDARY) ||
+	    !(ctrl_cpu_rev[1].clr & CPU_VIRT_APIC_ACCESSES)) {
+		report_skip("%s: niente virtualize APIC accesses", __func__);
+		return VMX_TEST_EXIT;
+	}
+	lf_apic_page = alloc_page();
+	vmcs_write(APIC_ACCS_ADDR, virt_to_phys(lf_apic_page));
+	vmcs_write(CPU_EXEC_CTRL0, vmcs_read(CPU_EXEC_CTRL0) | CPU_SECONDARY);
+	vmcs_write(CPU_EXEC_CTRL1, vmcs_read(CPU_EXEC_CTRL1) | CPU_VIRT_APIC_ACCESSES);
+	lf_cr3 = vmcs_read(GUEST_CR3);
+	lf_next_rax = 1;
+	lf_exits = lf_bad_qual = lf_bad_rip = lf_bad_cr3 = lf_bad_len = lf_bad_bytes = lf_bad_rax = 0;
+	lf_walk_fail = lf_nx_seen = 0;
+	lf_first_bad_rip = lf_first_bad_cr3 = 0;
+	return VMX_TEST_START;
+}
+
+static void lapic_fetch_main(void)
+{
+	u32 v = 1;
+
+	asm volatile("1:\n\t"
+	    ".globl lf_insn\n"
+	    "lf_insn:\n\t"
+	    "movl %%eax, 0x380(%%rcx)\n\t"
+	    "incl %%eax\n\t"
+	    "cmpl %%edx, %%eax\n\t"
+	    "jbe 1b\n\t"
+	    : "+a"(v) : "c"(lf_apic_page), "d"(LF_ITER) : "memory", "cc");
+	vmcall();
+}
+
+static int lapic_fetch_exit(union exit_reason exit_reason)
+{
+	struct guest_regs *regs = this_cpu_guest_regs();
+	u64 qual = vmcs_read(EXI_QUALIFICATION);
+	u64 rip = vmcs_read(GUEST_RIP);
+	u64 cr3 = vmcs_read(GUEST_CR3);
+	u8 b[6];
+	int nx;
+
+	switch (exit_reason.basic) {
+	case VMX_APIC_ACCESS:
+		lf_exits++;
+		if ((qual & 0xfff) != 0x380 || ((qual >> 12) & 0xf) != 1)
+			lf_bad_qual++;
+		if (rip != (u64)lf_insn) {
+			if (!lf_bad_rip++)
+				lf_first_bad_rip = rip;
+		}
+		if (cr3 != lf_cr3) {
+			if (!lf_bad_cr3++)
+				lf_first_bad_cr3 = cr3;
+		}
+		if (vmcs_read(EXI_INST_LEN) != 6)
+			lf_bad_len++;
+		if (!lf_walk_read(cr3, rip, b, 6, &nx))
+			lf_walk_fail++;
+		else if (memcmp(b, lf_insn_bytes, 6))
+			lf_bad_bytes++;
+		if (nx)
+			lf_nx_seen++;
+		if ((u32)regs->rax != lf_next_rax)
+			lf_bad_rax++;
+		lf_next_rax = (u32)regs->rax + 1;
+		vmcs_write(GUEST_RIP, rip + sizeof(lf_insn_bytes));
+		return VMX_TEST_RESUME;
+	case VMX_VMCALL:
+		printf("LAPICFETCH uscite=%u qual=%u rip=%u (primo %#lx) cr3=%u (primo %#lx) len=%u byte=%u "
+		    "walk=%u nx=%u rax=%u\n", lf_exits, lf_bad_qual, lf_bad_rip, lf_first_bad_rip, lf_bad_cr3,
+		    lf_first_bad_cr3, lf_bad_len, lf_bad_bytes, lf_walk_fail, lf_nx_seen, lf_bad_rax);
+		report(lf_exits == LF_ITER, "lapic_fetch: %u uscite APIC-access su %u scritture", lf_exits,
+		    LF_ITER);
+		report(lf_bad_qual + lf_bad_rip + lf_bad_cr3 + lf_bad_len == 0,
+		    "lapic_fetch: qualificazione, RIP, CR3 e lunghezza sempre quelli attesi");
+		report(lf_walk_fail + lf_bad_bytes + lf_nx_seen == 0,
+		    "lapic_fetch: i 6 byte riletti dal CR3 del VMCS12 sono sempre l'istruzione, eseguibile");
+		report(lf_bad_rax == 0, "lapic_fetch: RAX in sequenza (nessuna scrittura persa o duplicata)");
+		vmcs_write(GUEST_RIP, rip + vmcs_read(EXI_INST_LEN));
+		return VMX_TEST_RESUME;
+	default:
+		report_fail("lapic_fetch: uscita inattesa %d, qual %#lx, rip %#lx", exit_reason.basic, qual, rip);
+		return VMX_TEST_VMEXIT;
+	}
+}
+
 struct vmx_test vmx_tests[] = {
 	{ "null", NULL, basic_guest_main, basic_exit_handler, },
 	{ "vmenter", NULL, vmenter_main, vmenter_exit_handler, },
@@ -14140,6 +14270,7 @@ struct vmx_test vmx_tests[] = {
 		insn_intercept_exit_handler },
 	{ "EPT A/D disabled", ept_init, ept_main, ept_exit_handler },
 	{ "ept12_remap", ept12_remap_init, ept12_remap_main, ept12_remap_exit },
+	{ "lapic_fetch", lapic_fetch_init, lapic_fetch_main, lapic_fetch_exit },
 	{ "ept12_remap_g", ept12_remap_g_init, ept12_remap_main, ept12_remap_exit },
 	{ "ept12_remap_cold", ept12_remap_cold_init, ept12_remap_main, ept12_remap_exit },
 	{ "ept12_remap_invlpg", ept12_remap_invlpg_init, ept12_remap_main, ept12_remap_exit },
