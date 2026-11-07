@@ -6576,6 +6576,11 @@ static void test_xapic_rd(
 		report(apic_page_offset == reg,
 		       "got APIC access exit @ page offset 0x%03x, want 0x%03x",
 		       apic_page_offset, reg);
+		/* Claude 07/11/2026 (parere Astra 015): anche il tipo d'accesso,
+		 * bit 15:12 della qualificazione (0 = lettura lineare, 1 = scrittura) */
+		report(((vmcs_read(EXI_QUALIFICATION) >> 12) & 0xf) == 0,
+		       "APIC access exit: access type %lu, want 0 (linear read)",
+		       (vmcs_read(EXI_QUALIFICATION) >> 12) & 0xf);
 		skip_exit_insn();
 
 		/* Reenter guest so it can consume/check rcx and exit again. */
@@ -6629,6 +6634,11 @@ static void test_xapic_wr(
 		report(apic_page_offset == reg,
 		       "got APIC access exit @ page offset 0x%03x, want 0x%03x",
 		       apic_page_offset, reg);
+		/* Claude 07/11/2026 (parere Astra 015): anche il tipo d'accesso,
+		 * bit 15:12 della qualificazione (0 = lettura lineare, 1 = scrittura) */
+		report(((vmcs_read(EXI_QUALIFICATION) >> 12) & 0xf) == 1,
+		       "APIC access exit: access type %lu, want 1 (linear write)",
+		       (vmcs_read(EXI_QUALIFICATION) >> 12) & 0xf);
 		skip_exit_insn();
 
 		/* Reenter guest so it can consume/check rcx and exit again. */
@@ -6761,7 +6771,35 @@ static bool cpu_has_apicv(void)
 }
 
 /* Validates APIC register access across valid virtualization configurations. */
+static void apic_reg_virt_run(void);
+
 static void apic_reg_virt_test(void)
+{
+	if (!cpu_has_apicv()) {
+		report_skip("%s : Not all required APICv bits supported", __func__);
+		return;
+	}
+	apic_reg_virt_run();
+}
+
+/*
+ * Claude 07/11/2026 (parere Astra 015 §2): stesse configurazioni e verifiche
+ * di apic_reg_virt_test, ma richiede SOLO "virtualize APIC accesses". Le
+ * configurazioni che vogliono APIC-register virtualization o VID si saltano
+ * gia' una per una (CONFIG_TYPE_UNSUPPORTED); il filtro globale APICv di
+ * apic_reg_virt_test le saltava tutte, anche quelle con il solo APIC-access.
+ */
+static void apic_access_only_test(void)
+{
+	if (!(ctrl_cpu_rev[1].clr & CPU_VIRT_APIC_ACCESSES)) {
+		report_skip("%s : 'virtualize APIC accesses' not supported",
+			    __func__);
+		return;
+	}
+	apic_reg_virt_run();
+}
+
+static void apic_reg_virt_run(void)
 {
 	u32 *apic_access_address;
 	u32 *virtual_apic_page;
@@ -6770,11 +6808,6 @@ static void apic_reg_virt_test(void)
 	u64 cpu_exec_ctrl1 = vmcs_read(CPU_EXEC_CTRL1);
 	int i;
 	struct apic_reg_virt_guest_args *args = &apic_reg_virt_guest_args;
-
-	if (!cpu_has_apicv()) {
-		report_skip("%s : Not all required APICv bits supported", __func__);
-		return;
-	}
 
 	control = cpu_exec_ctrl1;
 	control &= ~CPU_VINTD;
@@ -14358,6 +14391,7 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_eoi_bitmap_ioapic_scan_test),
 	TEST(vmx_hlt_with_rvi_test),
 	TEST(apic_reg_virt_test),
+	TEST(apic_access_only_test),
 	TEST(virt_x2apic_mode_test),
 	TEST(vmx_basic_vid_test),
 	TEST(vmx_eoi_virt_test),
