@@ -6799,6 +6799,155 @@ static void apic_access_only_test(void)
 	apic_reg_virt_run();
 }
 
+/*
+ * Claude 07/11/2026 (parere Astra 015, casi aggiuntivi). Guest minimo: scrive
+ * args.val all'indirizzo args.addr (un MOV a 32 bit) e poi VMCALL.
+ */
+static volatile struct {
+	u32 *addr;
+	u32 val;
+	int op;				/* 0 = scrivi, 1 = termina */
+} aa_args;
+
+static void aa_guest(void)
+{
+	for (;;) {
+		if (aa_args.op == 1)
+			break;
+		*(volatile u32 *)aa_args.addr = aa_args.val;
+		vmcall();
+	}
+}
+
+/* Controlli dell'L1 per il solo "virtualize APIC accesses", TPR shadow spento. */
+static void aa_controls(u64 ctrl0, u64 ctrl1, u32 *page)
+{
+	vmcs_write(CPU_EXEC_CTRL0, (ctrl0 | CPU_SECONDARY) & ~CPU_TPR_SHADOW);
+	vmcs_write(CPU_EXEC_CTRL1, (ctrl1 & ~(CPU_VINTD | CPU_VIRT_X2APIC |
+	    CPU_APIC_REG_VIRT)) | CPU_VIRT_APIC_ACCESSES);
+	vmcs_write(APIC_ACCS_ADDR, virt_to_phys(page));
+}
+
+/* Una scrittura del guest che DEVE dare l'uscita APIC-access (motivo 44). */
+static void aa_expect_exit(u32 *page, u32 reg, const char *nome)
+{
+	u32 prima = page[reg / 4];
+
+	aa_args.addr = &page[reg / 4];
+	aa_args.val = 0xabcd1234;
+	aa_args.op = 0;
+	enter_guest();
+	report((vmcs_read(EXI_REASON) & 0xffff) == VMX_APIC_ACCESS,
+	       "%s: scrittura a +0x%03x -> uscita APIC-access (motivo %lu)",
+	       nome, reg, vmcs_read(EXI_REASON) & 0xffff);
+	report(vmcs_read(EXI_QUALIFICATION) == (0x1000 | reg),
+	       "%s: qualificazione %#lx, attesa %#x (scrittura lineare)",
+	       nome, vmcs_read(EXI_QUALIFICATION), 0x1000 | reg);
+	report(page[reg / 4] == prima,
+	       "%s: la scrittura intercettata NON e' arrivata in memoria", nome);
+	skip_exit_insn();
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+	skip_exit_vmcall();
+}
+
+/* Una scrittura del guest che NON deve uscire: arriva in memoria, poi VMCALL. */
+static void aa_expect_ram(u32 *page, u32 reg, const char *nome)
+{
+	page[reg / 4] = 0;
+	aa_args.addr = &page[reg / 4];
+	aa_args.val = 0x5a5a1234;
+	aa_args.op = 0;
+	enter_guest();
+	report((vmcs_read(EXI_REASON) & 0xffff) == VMX_VMCALL,
+	       "%s: scrittura a +0x%03x senza uscita APIC-access (motivo %lu)",
+	       nome, reg, vmcs_read(EXI_REASON) & 0xffff);
+	report(page[reg / 4] == 0x5a5a1234,
+	       "%s: il valore e' arrivato in memoria", nome);
+	if ((vmcs_read(EXI_REASON) & 0xffff) == VMX_APIC_ACCESS) {
+		skip_exit_insn();
+		enter_guest();
+	}
+	skip_exit_vmcall();
+}
+
+/*
+ * Cambio della pagina APIC-access P -> Q fra due ingressi: l'uscita deve
+ * seguire la pagina ATTUALE, mai la precedente (parere 015 §3.4).
+ */
+static void apic_access_switch_test(void)
+{
+	u64 ctrl0 = vmcs_read(CPU_EXEC_CTRL0), ctrl1 = vmcs_read(CPU_EXEC_CTRL1);
+	u32 *p, *q;
+
+	if (!(ctrl_cpu_rev[1].clr & CPU_VIRT_APIC_ACCESSES)) {
+		report_skip("%s : 'virtualize APIC accesses' not supported",
+			    __func__);
+		return;
+	}
+	test_set_guest(aa_guest);
+	p = alloc_page();
+	q = alloc_page();
+	force_4k_page(p);
+	force_4k_page(q);
+
+	aa_controls(ctrl0, ctrl1, p);
+	aa_expect_exit(p, 0x380, "P attiva");
+	aa_expect_ram(q, 0x320, "P attiva, scrittura su Q");
+
+	vmcs_write(APIC_ACCS_ADDR, virt_to_phys(q));
+	if (is_invvpid_type_supported(INVVPID_ALL))
+		invvpid(INVVPID_ALL, 0, 0);
+	aa_expect_exit(q, 0x320, "Q attiva");
+	aa_expect_ram(p, 0x380, "Q attiva, scrittura su P");
+
+	vmcs_write(APIC_ACCS_ADDR, virt_to_phys(p));
+	if (is_invvpid_type_supported(INVVPID_ALL))
+		invvpid(INVVPID_ALL, 0, 0);
+	aa_expect_exit(p, 0x380, "di nuovo P");
+
+	/* controllo spento: nessuna uscita su P */
+	vmcs_write(CPU_EXEC_CTRL1, vmcs_read(CPU_EXEC_CTRL1) &
+	    ~CPU_VIRT_APIC_ACCESSES);
+	aa_expect_ram(p, 0x380, "controllo spento");
+
+	vmcs_write(CPU_EXEC_CTRL0, ctrl0);
+	vmcs_write(CPU_EXEC_CTRL1, ctrl1);
+	aa_args.op = 1;
+	enter_guest();
+	assert_exit_reason(VMX_VMCALL);
+}
+
+/*
+ * Pagina APIC-access dell'L1 su un indirizzo che NON e' RAM (0xfee00000, il
+ * LAPIC emulato dell'L1). Architetturalmente i controlli sono validi; il
+ * nostro L0 (parere 015 §3.2) ferma la VM con una diagnosi esplicita invece
+ * di cambiare semantica in silenzio. ATTESO: la VM si ferma qui, dopo la
+ * riga "noram: ingresso"; nessun PASS/FAIL successivo. Va lanciato DA SOLO.
+ */
+static void apic_access_noram_test(void)
+{
+	u64 ctrl0 = vmcs_read(CPU_EXEC_CTRL0), ctrl1 = vmcs_read(CPU_EXEC_CTRL1);
+
+	if (!(ctrl_cpu_rev[1].clr & CPU_VIRT_APIC_ACCESSES)) {
+		report_skip("%s : 'virtualize APIC accesses' not supported",
+			    __func__);
+		return;
+	}
+	test_set_guest(aa_guest);
+	vmcs_write(CPU_EXEC_CTRL0, (ctrl0 | CPU_SECONDARY) & ~CPU_TPR_SHADOW);
+	vmcs_write(CPU_EXEC_CTRL1, (ctrl1 & ~(CPU_VINTD | CPU_VIRT_X2APIC |
+	    CPU_APIC_REG_VIRT)) | CPU_VIRT_APIC_ACCESSES);
+	vmcs_write(APIC_ACCS_ADDR, 0xfee00000ul);
+	aa_args.op = 1;
+	printf("noram: ingresso con APIC-access address non RAM\n");
+	enter_guest();
+	report_fail("noram: l'ingresso e' riuscito (motivo %lu): atteso l'arresto "
+		    "della VM da parte di L0", vmcs_read(EXI_REASON) & 0xffff);
+	vmcs_write(CPU_EXEC_CTRL0, ctrl0);
+	vmcs_write(CPU_EXEC_CTRL1, ctrl1);
+}
+
 static void apic_reg_virt_run(void)
 {
 	u32 *apic_access_address;
@@ -14392,6 +14541,8 @@ struct vmx_test vmx_tests[] = {
 	TEST(vmx_hlt_with_rvi_test),
 	TEST(apic_reg_virt_test),
 	TEST(apic_access_only_test),
+	TEST(apic_access_switch_test),
+	TEST(apic_access_noram_test),
 	TEST(virt_x2apic_mode_test),
 	TEST(vmx_basic_vid_test),
 	TEST(vmx_eoi_virt_test),
